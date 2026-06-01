@@ -166,54 +166,66 @@ async def create_order(
 
 async def _create_tbank_payment(order: OrderCreateIn) -> str:
     """Создает платеж в T-Bank и возвращает ссылку на оплату"""
+    amount_kopecks = int(order.total_rub * 100)  # Т-Банк принимает только копейки (int)
+
+    # 1. Параметры для генерации токена (Receipt сюда НЕ добавляем!)
     payment_params = {
         "TerminalKey": os.getenv("TERMINAL_KEY"),
-        "Amount": int(order.total_rub * 100),  # Tinkoff принимает копейки
+        "Amount": amount_kopecks,
         "OrderId": order.order_id,
-        "Description": f"Заказ в ByteWizard: {order.items[0].product_name}",  # ← тут кириллица
-        "CustomerKey": order.contact_email,
+        "Description": f"Заказ в ByteWizard: {order.items[0].product_name}",
+        "CustomerKey": order.contact_email or "guest@bytewizard.ru",
         "PayType": "O",
         "Language": order.locale,
     }
-    
+
     token = generator.generate_tinkoff_token(payment_params, os.getenv("SECRET_PASSWORD"))
-    
+
+    # 2. Формируем чек для 54-ФЗ (обязательно для Т-Банка)
+    receipt = {
+        "Email": order.contact_email or "test@test.com",
+        "Phone": order.contact_phone or "",
+        "Taxation": "usn_income",
+        "Items": [
+            {
+                "Name": order.items[0].product_name,
+                "Price": amount_kopecks,
+                "Quantity": 1.0,
+                "Amount": amount_kopecks,
+                "Tax": "none" 
+            }
+        ]
+    }
+
+    # 3. Собираем финальный пейлоад (Receipt добавляем ПОСЛЕ токена)
     full_payload = {
         **payment_params,
         "Token": token,
+        "Receipt": receipt,
         "DATA": {
-            "Email": order.contact_email,
+            "Email": order.contact_email or "",
             "Phone": order.contact_phone or "",
             "OperationInitiatorType": "0"
         },
     }
-    
+
     conn = http.client.HTTPSConnection(os.getenv("TINKOFF_API_URL"))
-    
-    # 🔹 ФИКС: добавляем charset=utf-8 в заголовок
     headers = {"Content-Type": "application/json; charset=utf-8"}
-    
+
     try:
-        # 🔹 ФИКС: явно кодируем body в UTF-8 байты
         body = json.dumps(full_payload, ensure_ascii=False).encode('utf-8')
-        
-        conn.request(
-            "POST", "/v2/Init",
-            body=body,  # ← отправляем bytes, а не str
-            headers=headers
-        )
+        conn.request("POST", "/v2/Init", body=body, headers=headers)
         response = conn.getresponse()
         result = json.loads(response.read().decode("utf-8"))
-        
+
         if result.get("Success"):
             return result["PaymentURL"]
         else:
             logger.error(f"T-Bank error: {result}")
-            raise Exception(f"T-Bank API error: {result.get('Message')}")
-            
+            raise Exception(f"T-Bank API error: {result.get('Message')} | Code: {result.get('ErrorCode')}")
+
     finally:
         conn.close()
-
 
 async def _create_cryptocloud_payment(order: OrderCreateIn) -> str:
     """Создает инвойс в CryptoCloud и возвращает ссылку"""
