@@ -153,21 +153,28 @@ async def create_order(
         
         logger.info(f"✅ Заказ {payload.order_id} создан. Оплата: {payment_url}")
 
-        #  УВЕДОМЛЕНИЕ О СОЗДАНИИ ЗАКАЗА (сразу, не ждём оплаты)
+        # 🔹 ДЕБАГ: Явно логируем перед вызовом
+        logger.info("📤 Пытаемся отправить уведомление в Telegram...")
+        logger.info(f"   Order ID: {payload.order_id}")
+        logger.info(f"   Total: {payload.total_rub}")
+        logger.info(f"   Email: {payload.contact_email}")
+        
         try:
-            # create_task запускает функцию в фоне, не блокируя ответ API
-            asyncio.create_task(
+            # Создаём задачу явно
+            task = asyncio.create_task(
                 send_telegram_notification(
                     order_id=payload.order_id,
                     amount_rub=payload.total_rub,
-                    event="created",  # ← новый параметр
+                    event="created",
                     email=payload.contact_email,
                     phone=payload.contact_phone,
                     method=payload.payment_method
                 )
             )
+            logger.info(f"   ✅ Задача Telegram создана: {task}")
+            
         except Exception as e:
-            logger.error(f"⚠️ Не удалось запустить уведомление: {e}")
+            logger.error(f"   ❌ ОШИБКА при создании задачи: {e}", exc_info=True)
         
         return OrderCreateOut(
             success=True,
