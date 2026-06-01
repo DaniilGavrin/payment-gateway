@@ -1,3 +1,4 @@
+import asyncio
 import os
 import requests
 import jwt
@@ -151,6 +152,22 @@ async def create_order(
             raise HTTPException(status_code=502, detail="Не удалось создать ссылку на оплату")
         
         logger.info(f"✅ Заказ {payload.order_id} создан. Оплата: {payment_url}")
+
+        #  УВЕДОМЛЕНИЕ О СОЗДАНИИ ЗАКАЗА (сразу, не ждём оплаты)
+        try:
+            # create_task запускает функцию в фоне, не блокируя ответ API
+            asyncio.create_task(
+                send_telegram_notification(
+                    order_id=payload.order_id,
+                    amount_rub=payload.total_rub,
+                    event="created",  # ← новый параметр
+                    email=payload.contact_email,
+                    phone=payload.contact_phone,
+                    method=payload.payment_method
+                )
+            )
+        except Exception as e:
+            logger.error(f"⚠️ Не удалось запустить уведомление: {e}")
         
         return OrderCreateOut(
             success=True,
@@ -438,13 +455,6 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
                 new_status,
                 order_id
             )
-            
-            # 🔹 5. Отправляем уведомление в Telegram (если оплачено)
-            if new_status == "paid":
-                try:
-                    await send_telegram_notification(order_id, amount / 100)  # сумма в рублях
-                except Exception as e:
-                    logger.error(f"❌ Не удалось отправить уведомление в Telegram: {e}")
         
         # 🔹 6. Помечаем вебхук как обработанный
         await db.execute(
