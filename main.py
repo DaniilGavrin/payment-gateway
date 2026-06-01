@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import http.client
 import generator
+import httpx
 
 
 from urllib.parse import parse_qsl
@@ -363,6 +364,150 @@ async def cryptocloud_webhook(request: Request, _db: bool = Depends(require_db_c
             "processed_at": datetime.utcnow().isoformat()
         }
     )
+
+@app.post("/api/t-bank/notification")
+async def tbank_notification(request: Request, _: bool = Depends(require_db_connection)):
+    """
+    Продакшен-обработчик вебхуков от Т-Банка.
+    """
+    try:
+        data = await request.json()
+        
+        # 🔹 1. Логируем всё (для отладки)
+        logger.info(f"🔔 Webhook от Т-Банка: {json.dumps(data, ensure_ascii=False)}")
+        
+        payment_id = data.get("PaymentId")
+        order_id = data.get("OrderId")
+        status = data.get("Status")
+        amount = data.get("Amount")
+        
+        # 🔹 2. Проверка токена (БЕЗОПАСНОСТЬ!)
+        if not generator.verify_tbank_webhook_token(data, os.getenv("SECRET_PASSWORD")):
+            logger.error(f"❌ НЕВЕРНЫЙ ТОКЕН от Т-Банка! PaymentId={payment_id}")
+            return {"Status": "ERROR"}
+        
+        # 🔹 3. Идемпотентность (проверяем, не обрабатывали ли уже)
+        exists = await db.fetchval(
+            "SELECT 1 FROM processed_webhooks WHERE payment_id = $1",
+            payment_id
+        )
+        if exists:
+            logger.info(f"⏭️ Webhook уже обработан: PaymentId={payment_id}")
+            return {"Status": "OK"}  # Т-Банк требует OK даже для дублей
+        
+        # 🔹 4. Обновляем статус заказа
+        new_status = "pending"
+        
+        if status == "CONFIRMED":
+            new_status = "paid"
+            logger.info(f"✅ Заказ {order_id} ОПЛАЧЕН на сумму {amount} коп.")
+            
+        elif status == "REJECTED":
+            new_status = "failed"
+            logger.warning(f"❌ Заказ {order_id} ОТКЛОНЁН банком")
+            
+        elif status == "REVERSED":
+            new_status = "refunded"
+            logger.warning(f"↩️ Заказ {order_id} ОТМЕНЁН (возврат)")
+            
+        elif status == "3DS_CHECKED":
+            # Это промежуточный статус, не меняем основной статус
+            logger.info(f"⏳ Заказ {order_id}: 3D-Secure проверен, ждём CONFIRMED")
+            await db.execute(
+                "UPDATE orders SET status = '3ds_checked', updated_at = NOW() WHERE order_code = $1",
+                order_id
+            )
+            # Помечаем вебхук как обработанный
+            await db.execute(
+                "INSERT INTO processed_webhooks (payment_id) VALUES ($1)",
+                payment_id
+            )
+            return {"Status": "OK"}
+            
+        else:
+            logger.warning(f"⚠️ Неизвестный статус {status} для заказа {order_id}")
+        
+        # Обновляем статус в БД (если не 3DS_CHECKED)
+        if new_status != "pending":
+            await db.execute(
+                """
+                UPDATE orders 
+                SET status = $1, updated_at = NOW() 
+                WHERE order_code = $2
+                """,
+                new_status,
+                order_id
+            )
+            
+            # 🔹 5. Отправляем уведомление в Telegram (если оплачено)
+            if new_status == "paid":
+                try:
+                    await send_telegram_notification(order_id, amount / 100)  # сумма в рублях
+                except Exception as e:
+                    logger.error(f"❌ Не удалось отправить уведомление в Telegram: {e}")
+        
+        # 🔹 6. Помечаем вебхук как обработанный
+        await db.execute(
+            "INSERT INTO processed_webhooks (payment_id) VALUES ($1)",
+            payment_id
+        )
+        
+        logger.info(f"✅ Webhook обработан: PaymentId={payment_id}, Status={new_status}")
+        
+        # Т-Банк требует ответ {"Status": "OK"}
+        return {"Status": "OK"}
+        
+    except Exception as e:
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА в webhook: {e}", exc_info=True)
+        # Даже при ошибке возвращаем OK, чтобы Т-Банк не спамил
+        return {"Status": "OK"}
+
+
+# 🔹 Вспомогательная функция для уведомлений
+async def send_telegram_notification(order_id: str, amount_rub: float):
+    """Отправляет уведомление в Telegram админу"""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
+    
+    if not bot_token or not chat_id:
+        logger.warning("⚠️ TELEGRAM_BOT_TOKEN или CHAT_ID не настроены")
+        return
+    
+    # Получаем детали заказа из БД
+    order = await db.fetchrow(
+        """
+        SELECT client_email, client_phone, payment_method, total_rub
+        FROM orders 
+        WHERE order_code = $1
+        """,
+        order_id
+    )
+    
+    message = f"""
+💳 <b>НОВЫЙ ОПЛАЧЕННЫЙ ЗАКАЗ</b>
+
+ <b>Заказ:</b> {order_id}
+💰 <b>Сумма:</b> {amount_rub:,.2f} ₽
+📧 <b>Email:</b> {order['client_email']}
+📱 <b>Телефон:</b> {order['client_phone'] or 'не указан'}
+💳 <b>Оплата:</b> {order['payment_method']}
+
+<a href="https://shop.bytewizard.ru/ru/profile">👉 Посмотреть в админке</a>
+"""
+    
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message.strip(),
+        "parse_mode": "HTML"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            logger.info("✅ Уведомление отправлено в Telegram")
+        else:
+            logger.error(f"❌ Ошибка отправки в Telegram: {response.text}")
 
 if __name__ == "__main__":
     import uvicorn
