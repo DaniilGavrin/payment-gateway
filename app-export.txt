@@ -1,0 +1,825 @@
+=== ByteWizard App Export ===
+Дата: 29.05.2026 10:48:28
+
+=============================================
+
+
+─────────────────────────────────────────
+FILE: .gitignore
+─────────────────────────────────────────
+
+.env
+.venv/
+
+
+─────────────────────────────────────────
+FILE: collect-app.py
+─────────────────────────────────────────
+
+﻿from pathlib import Path
+from datetime import datetime
+
+# ============================================
+# НАСТРОЙКИ
+# ============================================
+
+ROOT_DIR = Path(__file__).parent.resolve()
+OUTPUT_FILE = ROOT_DIR / "app-export.txt"
+
+EXCLUDE_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+    ".idea",
+    ".vscode"
+}
+
+EXCLUDE_FILES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "app-export.txt"
+}
+
+BINARY_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".ico",
+    ".svg",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".mp3",
+    ".mp4",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".exe",
+    ".dll",
+    ".so",
+    ".bin",
+    ".pyc"
+}
+
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+
+# ============================================
+# СОЗДАЕМ ФАЙЛ
+# ============================================
+
+with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+    out.write("=== ByteWizard App Export ===\n")
+    out.write(
+        f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+    )
+    out.write("=============================================\n\n")
+
+processed = 0
+skipped = 0
+
+# ============================================
+# ОБХОД ФАЙЛОВ
+# ============================================
+
+for file_path in ROOT_DIR.rglob("*"):
+
+    # Только файлы
+    if not file_path.is_file():
+        continue
+
+    # Пропуск директорий
+    if any(part in EXCLUDE_DIRS for part in file_path.parts):
+        skipped += 1
+        continue
+
+    # Пропуск файлов
+    if file_path.name in EXCLUDE_FILES:
+        skipped += 1
+        continue
+
+    # Пропуск бинарников
+    if file_path.suffix.lower() in BINARY_EXTENSIONS:
+        skipped += 1
+        continue
+
+    # Пропуск больших файлов
+    try:
+        size = file_path.stat().st_size
+
+        if size > MAX_FILE_SIZE:
+            print(f"[SKIP BIG] {file_path}")
+            skipped += 1
+            continue
+
+    except Exception:
+        skipped += 1
+        continue
+
+    # Относительный путь
+    relative_path = file_path.relative_to(ROOT_DIR)
+
+    # Чтение файла
+    try:
+        content = file_path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+    except Exception as e:
+        print(f"[ERROR] {relative_path}: {e}")
+        skipped += 1
+        continue
+
+    # Если файл пустой
+    if not content.strip():
+        continue
+
+    # Запись в общий txt
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as out:
+        out.write("\n")
+        out.write("─────────────────────────────────────────\n")
+        out.write(f"FILE: {relative_path}\n")
+        out.write("─────────────────────────────────────────\n\n")
+
+        out.write(content)
+        out.write("\n\n")
+
+    processed += 1
+    print(f"[OK] {relative_path}")
+
+# ============================================
+# ФИНАЛ
+# ============================================
+
+final_size = OUTPUT_FILE.stat().st_size
+
+print("\n===================================")
+print(f"Готово!")
+print(f"Файл: {OUTPUT_FILE.name}")
+print(f"Обработано: {processed}")
+print(f"Пропущено: {skipped}")
+print(f"Размер: {final_size:,} байт")
+
+
+─────────────────────────────────────────
+FILE: dependencies.py
+─────────────────────────────────────────
+
+import asyncio
+
+from fastapi import HTTPException, status
+from database.db import db
+
+
+async def require_db_connection():
+    """
+    Проверяет доступность PostgreSQL.
+    """
+
+    try:
+        is_connected = await asyncio.wait_for(
+            db.check_connection(),
+            timeout=2.0
+        )
+
+        if not is_connected:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "success": False,
+                    "error": "Database unavailable"
+                }
+            )
+
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "success": False,
+                "error": "Database timeout"
+            }
+        )
+
+    return True
+
+
+─────────────────────────────────────────
+FILE: generator.py
+─────────────────────────────────────────
+
+import hashlib
+
+def generate_tinkoff_token(payload: dict, password: str) -> str:
+    flat_params = {
+        key: str(value) if value is not None else ""
+        for key, value in payload.items()
+        if not isinstance(value, (dict, list))
+    }
+    flat_params["Password"] = password
+    sorted_params = sorted(flat_params.items(), key=lambda x: x[0])
+    concatenated = "".join(value for _, value in sorted_params)
+    return hashlib.sha256(concatenated.encode("utf-8")).hexdigest()
+
+
+─────────────────────────────────────────
+FILE: main.py
+─────────────────────────────────────────
+
+import os
+import requests
+import jwt
+import logging
+import json
+import time
+import hashlib
+import hmac
+import http.client
+import generator
+
+
+from urllib.parse import parse_qsl
+from datetime import datetime
+from contextlib import asynccontextmanager
+from database.db import db
+from dotenv import load_dotenv
+from dependencies import require_db_connection
+
+
+from models import PaymentRequest, PaymentCancel, PaymentList, CryptoCloudWebhook
+from services.webhook_service import is_webhook_processed, process_payment_webhook, mark_webhook_processed
+
+
+from fastapi import FastAPI, HTTPException, Request, Depends, Header, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+JWT_SECRET = os.getenv("JWT_SECRET")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.connect()
+    yield
+    await db.disconnect()
+
+app = FastAPI(lifespan=lifespan)
+logger = logging.getLogger(__name__)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def verify_cryptocloud_jwt(token: str) -> bool:
+    """Проверяет JWT-токен от CryptoCloud (HS256, SECRET_KEY)."""
+    secret = os.getenv("CRYPTOCLOUD_SECRET_KEY", "").encode()
+    if not secret:
+        logger.warning("⚠️ CRYPTOCLOUD_SECRET_KEY not set")
+        return False  # 🔒 В продакшене — строго False!
+
+    try:
+        jwt.decode(token, secret, algorithms=["HS256"], options={"require": ["exp"]})
+        return True
+    except jwt.ExpiredSignatureError:
+        logger.warning(f"⚠️ JWT expired: {token[:20]}...")
+        return False
+    except jwt.InvalidSignatureError:
+        logger.error(f"❌ JWT signature mismatch: {token[:20]}...")
+        return False
+    except jwt.DecodeError as e:
+        logger.error(f"❌ JWT decode error: {e}")
+        return False
+
+def verify_admin_token(token: str = Header(..., alias="X-Admin-Token")):
+    expected = os.getenv("CRYPTOCLOUD_SECRET")
+    if not expected or token != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin token")
+    return token
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "message": "FastAPI Payment Gateway is running"
+    }
+
+@app.post("/api/t-bank/cancel-payment")
+async def cancel_payment(request: Request, _: bool = Depends(require_db_connection)):
+    payment_params = {
+        "TerminalKey": os.getenv("TERMINAL_KEY"),
+        "Amount": 100000,
+        "PaymentId": "8369548692",
+    }
+
+    # Генерируем токен
+    token = generator.generate_tinkoff_token(payment_params, os.getenv("SECRET_PASSWORD"))
+    print(f"🔑 Token: {token}")
+
+    # Формируем полный пейлоад для отправки (уже с токеном и вложенными данными)
+    full_payload = {
+        **payment_params,
+        "Token": token
+    }
+
+    # Отправляем запрос
+    conn = http.client.HTTPSConnection(os.getenv("TINKOFF_API_URL"))
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        conn.request(
+            "POST",
+            "/v2/Cancel",  # метод инициирования платежа
+            body=json.dumps(full_payload, ensure_ascii=False),
+            headers=headers
+        )
+        response = conn.getresponse()
+        result = json.loads(response.read().decode("utf-8"))
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/t-bank/create-payment")
+async def create_payment(_: bool = Depends(require_db_connection)):
+    # Параметры, которые участвуют в токене (только корневой уровень!)
+    payment_params = {
+        "TerminalKey": os.getenv("TERMINAL_KEY"),
+        "Amount": 100000,
+        "OrderId": "TEST_ORDER_ID3",  # обрати внимание: в доке OrderId, а не OrderID
+        "Description": "TEST DESCRIPTION",
+        "CustomerKey": "TEST_CUSTOMER_KEY",
+        "PayType": "O",
+        "Language": "ru",
+        # DATA и другие вложенные объекты НЕ добавляем сюда — они не участвуют в токене
+    }
+
+    # Генерируем токен
+    token = generator.generate_tinkoff_token(payment_params, os.getenv("SECRET_PASSWORD"))
+    print(f"🔑 Token: {token}")
+
+    # Формируем полный пейлоад для отправки (уже с токеном и вложенными данными)
+    full_payload = {
+        **payment_params,
+        "Token": token,
+        "DATA": {
+            "OperationInitiatorType": "0"
+        },
+    }
+
+    # Отправляем запрос
+    conn = http.client.HTTPSConnection(os.getenv("TINKOFF_API_URL"))
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        conn.request(
+            "POST",
+            "/v2/Init",  # метод инициирования платежа
+            body=json.dumps(full_payload, ensure_ascii=False),
+            headers=headers
+        )
+        response = conn.getresponse()
+        result = json.loads(response.read().decode("utf-8"))
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/t-bank/notification")
+async def tbank_notification(request: Request, _: bool = Depends(require_db_connection)):
+    data = await request.json()
+    print(f"Получено уведомление: {data}")
+    # Тут нужна проверка подписи уведомления!
+    return {"Status": "OK"}
+
+
+
+@app.post("/api/crypto-cloud/create-payment")
+async def cryptocloud_create_payment(req: PaymentRequest):
+    url = f"{os.getenv("CRYPTOCLOUD_API_URL")}invoice/create"
+    print(f"DEGUB: URL {url}")
+
+    headers = {
+        "Authorization": f"Token {os.getenv("CRYPTOCLOUD_API_KEY")}",
+        "Content-Type": "application/json"
+    }
+    print(f"DEBUG: Headers {headers}")
+
+    data = {
+        "amount": req.amount,
+        "shop_id": os.getenv("CRYPTOCLOUD_SHOP_ID"),
+        "currency": req.currency,
+        "order_id": req.order_id  # если API поддерживает
+    }
+
+    response = requests.post(url, headers=headers, json=data)
+
+    if response.status_code == 200:
+        result = response.json()["result"]
+        return {
+            "success": True,
+            "payment_url": result["link"],
+            "invoice_uuid": result["uuid"],
+            "amount": result["amount"],
+            "currency": result["currency"]["code"]
+        }
+    else:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"CryptoCloud error: {response.text[:200]}"
+        )
+
+
+@app.post("/api/crypto-cloud/cancel-payment")
+async def cryptocloud_cancel_payment(req: PaymentCancel, _db: str = Depends(verify_admin_token), _: bool = Depends(require_db_connection)):
+    url = f"{os.getenv("CRYPTOCLOUD_API_URL")}invoice/merchant/canceled"
+    print(f"DEGUB: URL {url}")
+
+    headers = {
+        "Authorization": f"Token {os.getenv("CRYPTOCLOUD_API_KEY")}",
+        "Content-Type": "application/json"
+    }
+    print(f"DEBUG: Headers {headers}")
+
+    data = {
+        "uuid": req.uuid,
+    }
+
+    response = requests.post(url, headers=headers, json=data)
+
+    if response.status_code == 200:
+        print("Success:", response.json())
+        result = response.json()["status"]
+        return {
+            "success": True
+        }
+
+    else:
+        print("Fail:", response.status_code, response.text)
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"CryptoCloud error: {response.text[:200]}"
+        )
+
+
+@app.post("/api/crypto-cloud/list-payments")
+async def cryptocloud_list_payments(req: PaymentList, _: str = Depends(verify_admin_token), _db: bool = Depends(require_db_connection)):
+    url = f"{os.getenv("CRYPTOCLOUD_API_URL")}invoice/merchant/list"
+
+    headers = {
+        "Authorization": f"Token {os.getenv('CRYPTOCLOUD_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "start": req.start,
+        "end": req.end,
+        "offset": req.offset,
+        "limit": req.limit
+    }
+
+    print(f"🔍 URL: {url}")
+    print(f"🔍 Data: {data}")
+
+    response = requests.post(url, headers=headers, json=data)
+
+    if response.status_code == 200:
+        print("Success:", response.json())
+        result = response.json()
+        return {
+            "success": True,
+            "data": result.get("result", []),
+            "pagination": {
+                "offset": req.offset,
+                "limit": req.limit,
+                "total": len(result.get("result", []))
+            }
+        }
+    else:
+        print(f"❌ Fail {response.status_code}: {response.text[:300]}")
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"CryptoCloud error: {response.text[:200]}"
+        )
+
+
+@app.post("/api/crypto-cloud/callback")
+async def cryptocloud_webhook(request: Request, _db: bool = Depends(require_db_connection) ):
+    """
+    Обработчик POSTBACK от CryptoCloud (только JSON).
+    Отвечает быстро, тяжёлую логику выносит в process_payment_webhook.
+    """
+
+    # 🔹 1. Быстрая проверка Content-Type
+    if not request.headers.get("Content-Type", "").startswith("application/json"):
+        logger.warning(f"❌ Wrong Content-Type: {request.headers.get('Content-Type')}")
+        raise HTTPException(status_code=415, detail="Only application/json accepted")
+
+    # 🔹 2. Парсим JSON (FastAPI сделает это эффективно)
+    try:
+        body = await request.json()
+    except Exception as e:
+        logger.error(f"❌ JSON parse error: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # 🔹 3. Валидация через Pydantic (опционально, но даёт чёткие ошибки)
+    try:
+        webhook = CryptoCloudWebhook(**body)
+    except Exception as e:
+        logger.warning(f"⚠️ Validation error: {e}")
+        raise HTTPException(status_code=422, detail=f"Invalid payload: {str(e)}")
+
+    # 🔹 4. Проверка подписи (самое важное!)
+    if not verify_cryptocloud_jwt(webhook.token):
+        raise HTTPException(status_code=401, detail="Invalid token signature")
+
+    # 🔹 5. Идемпотентность: не обрабатывай дубли
+    if await is_webhook_processed(webhook.invoice_id):
+        logger.info(f"⏭️ Duplicate webhook, skipping: {webhook.invoice_id}")
+        return JSONResponse(status_code=200, content={"status": "ok", "skipped": True})
+
+    # 🔹 6. Асинхронно обрабатываем бизнес-логику (не блокируя ответ)
+    # Если логика тяжёлая — вынеси в очередь задач (Celery/RQ)
+    await process_payment_webhook(
+        invoice_id=webhook.invoice_id,
+        order_id=webhook.order_id,
+        status=webhook.status,
+        invoice_info=webhook.invoice_info
+    )
+
+    # 🔹 7. Помечаем как обработанный
+    await mark_webhook_processed(webhook.invoice_id)
+
+    # 🔹 8. Отвечаем быстро — CryptoCloud ждёт 200
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "ok",
+            "invoice_id": webhook.invoice_id,
+            "processed_at": datetime.utcnow().isoformat()
+        }
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
+
+
+─────────────────────────────────────────
+FILE: models.py
+─────────────────────────────────────────
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+from datetime import datetime
+
+class PaymentRequest(BaseModel):
+    amount: float = Field(..., ge=1, le=100000, description="Сумма платежа")
+    currency: str = Field(default="USD", pattern="^(USD|RUB|EUR|USDT)$")
+    order_id: str = Field(..., min_length=1, max_length=64, description="ID заказа в твоей системе")
+
+class PaymentCancel(BaseModel):
+    uuid: str = Field(description="UUID счёта")
+
+class PaymentList(BaseModel):
+    start: str = Field(..., description="Дата начала в формате dd.mm.yyyy", examples=["01.01.2026"])
+    end: str = Field(..., description="Дата конца в формате dd.mm.yyyy", examples=["31.01.2026"])
+    offset: int = Field(default=0, ge=0, description="Номер начальной записи")
+    limit: int = Field(default=10, ge=1, le=100, description="Количество записей (1-100)")
+
+    # 🔹 Валидация формата даты
+    @field_validator("start", "end")
+    @classmethod
+    def validate_date_format(cls, v: str) -> str:
+        try:
+            datetime.strptime(v, "%d.%m.%Y")
+        except ValueError:
+            raise ValueError("Дата должна быть в формате dd.mm.yyyy")
+        return v
+
+    # 🔹 Валидация: end >= start
+    @model_validator(mode="after")
+    def validate_date_range(self):
+        start_dt = datetime.strptime(self.start, "%d.%m.%Y")
+        end_dt = datetime.strptime(self.end, "%d.%m.%Y")
+        if end_dt < start_dt:
+            raise ValueError("Дата end должна быть >= start")
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "start": "01.01.2026",
+                "end": "31.01.2026",
+                "offset": 0,
+                "limit": 10
+            }]
+        }
+    }
+
+class CryptoCloudWebhook(BaseModel):
+    status: str = Field(..., pattern="^(success|failed|expired|canceled)$")
+    invoice_id: str = Field(..., min_length=1)  # без префикса INV
+    order_id: str | None = None
+    amount_crypto: float = Field(..., gt=0)
+    currency: str = Field(..., min_length=3)
+    token: str = Field(..., min_length=20)
+    invoice_info: dict | None = None  # подробная инфа, если пришла
+
+
+─────────────────────────────────────────
+FILE: requirements.txt
+─────────────────────────────────────────
+
+aiofiles==25.1.0
+aiogram==3.28.2
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.5
+aiosignal==1.4.0
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+asyncpg==0.31.0
+attrs==26.1.0
+certifi==2026.4.22
+click==8.4.0
+colorama==0.4.6
+fastapi==0.136.1
+frozenlist==1.8.0
+h11==0.16.0
+idna==3.15
+iniconfig==2.3.0
+magic-filter==1.0.12
+multidict==6.7.1
+packaging==26.2
+pluggy==1.6.0
+propcache==0.5.2
+pydantic==2.13.4
+pydantic-core==2.46.4
+pydantic-settings==2.14.1
+pygments==2.20.0
+pyjwt==2.12.1
+pytest==9.0.3
+pytest-asyncio==1.3.0
+python-dotenv==1.2.2
+python-json-logger==4.1.0
+starlette==1.0.0
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+uvicorn==0.47.0
+watchfiles==1.1.1
+yarl==1.23.0
+
+
+
+─────────────────────────────────────────
+FILE: database\db.py
+─────────────────────────────────────────
+
+import asyncpg
+import os
+import logging
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+class Database:
+    def __init__(self):
+        self.pool = None
+
+    async def connect(self):
+        if self.pool:
+            return
+
+        self.pool = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            ssl="require"
+        )
+
+        logger.info("✅ PostgreSQL connected")
+
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+            logger.info("🔌 PostgreSQL disconnected")
+
+    async def check_connection(self) -> bool:
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        except Exception as e:
+            logger.error(f"DB ERROR: {e}")
+            return False
+
+    async def fetch(self, query: str, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+    async def fetchrow(self, query: str, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(query, *args)
+
+    async def fetchval(self, query: str, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(query, *args)
+
+    async def execute(self, query: str, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
+
+db = Database()
+
+
+─────────────────────────────────────────
+FILE: services\webhook_service.py
+─────────────────────────────────────────
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+async def is_webhook_processed(invoice_id: str) -> bool:
+    """
+    Проверяет, не обрабатывали ли уже этот invoice_id.
+    Реализуй под свою БД/кеш (Redis, PostgreSQL, etc.)
+    """
+    # Пример для псевдокода:
+    # return await redis.sismember("processed_webhooks", invoice_id)
+    return False  # ← заглушка, замени на реальную проверку
+
+
+async def mark_webhook_processed(invoice_id: str):
+    """Помечает invoice_id как обработанный (для идемпотентности)."""
+    # await redis.sadd("processed_webhooks", invoice_id)
+    # await redis.expire("processed_webhooks", 86400)  # храним сутки
+    pass  # ← заглушка
+
+
+async def process_payment_webhook(invoice_id: str, order_id: str | None, status: str, invoice_info: dict | None):
+    """
+    Бизнес-логика: обновляем БД, шлём уведомления, активируем доступ.
+    Выполняется после успешной проверки токена.
+    """
+    logger.info(f"🔄 Processing webhook: invoice_id={invoice_id}, order_id={order_id}, status={status}")
+
+    # 🔹 Извлекаем данные из invoice_info (если есть)
+    uuid = (invoice_info or {}).get("uuid")
+    amount = (invoice_info or {}).get("amount")
+    currency_code = (invoice_info or {}).get("currency", {}).get("code")
+
+    # 🔹 Пример: обновление статуса в БД (псевдокод)
+    # await db.execute(
+    #     """
+    #     UPDATE orders
+    #     SET status = $1, paid_at = NOW(), crypto_tx_hash = $2
+    #     WHERE order_id = $3 OR uuid = $4
+    #     """,
+    #     status,
+    #     (invoice_info or {}).get("tx_hash"),
+    #     order_id,
+    #     uuid
+    # )
+
+    # 🔹 Если оплата прошла — можно отправить уведомление во Flutter через Firebase/APN
+    # if status == "success":
+    #     await send_push_notification(order_id, "Оплата подтверждена ✅")
+
+    logger.info(f"✅ Processed: {order_id or uuid}")
+
+
