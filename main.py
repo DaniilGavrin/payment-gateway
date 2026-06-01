@@ -166,18 +166,16 @@ async def create_order(
 
 async def _create_tbank_payment(order: OrderCreateIn) -> str:
     """Создает платеж в T-Bank и возвращает ссылку на оплату"""
-    # Используем твою существующую логику, адаптированную под динамические данные
     payment_params = {
         "TerminalKey": os.getenv("TERMINAL_KEY"),
         "Amount": int(order.total_rub * 100),  # Tinkoff принимает копейки
         "OrderId": order.order_id,
-        "Description": f"Заказ в ByteWizard: {order.items[0].product_name}",
-        "CustomerKey": order.contact_email,  # или хэш от email
+        "Description": f"Заказ в ByteWizard: {order.items[0].product_name}",  # ← тут кириллица
+        "CustomerKey": order.contact_email,
         "PayType": "O",
         "Language": order.locale,
     }
     
-    # Генерация токена (твоя существующая функция)
     token = generator.generate_tinkoff_token(payment_params, os.getenv("SECRET_PASSWORD"))
     
     full_payload = {
@@ -190,22 +188,25 @@ async def _create_tbank_payment(order: OrderCreateIn) -> str:
         },
     }
     
-    # Отправка запроса (синхронный requests в асинхронной функции — не идеально,
-    # но для старта ок. В продакшене лучше httpx или aiohttp)
     conn = http.client.HTTPSConnection(os.getenv("TINKOFF_API_URL"))
-    headers = {"Content-Type": "application/json"}
+    
+    # 🔹 ФИКС: добавляем charset=utf-8 в заголовок
+    headers = {"Content-Type": "application/json; charset=utf-8"}
     
     try:
+        # 🔹 ФИКС: явно кодируем body в UTF-8 байты
+        body = json.dumps(full_payload, ensure_ascii=False).encode('utf-8')
+        
         conn.request(
             "POST", "/v2/Init",
-            body=json.dumps(full_payload, ensure_ascii=False),
+            body=body,  # ← отправляем bytes, а не str
             headers=headers
         )
         response = conn.getresponse()
         result = json.loads(response.read().decode("utf-8"))
         
         if result.get("Success"):
-            return result["PaymentURL"]  # Ссылка на оплату от Tinkoff
+            return result["PaymentURL"]
         else:
             logger.error(f"T-Bank error: {result}")
             raise Exception(f"T-Bank API error: {result.get('Message')}")
