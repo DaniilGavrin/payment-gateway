@@ -474,50 +474,55 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
 
 
 # 🔹 Вспомогательная функция для уведомлений
-async def send_telegram_notification(order_id: str, amount_rub: float):
-    """Отправляет уведомление в Telegram админу"""
+async def send_telegram_notification(
+    order_id: str, 
+    amount_rub: float, 
+    event: str = "created",
+    email: str = "", 
+    phone: str = "", 
+    method: str = ""
+):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
     
     if not bot_token or not chat_id:
-        logger.warning("⚠️ TELEGRAM_BOT_TOKEN или CHAT_ID не настроены")
+        logger.warning("⚠️ TELEGRAM_BOT_TOKEN или CHAT_ID не заданы")
         return
-    
-    # Получаем детали заказа из БД
-    order = await db.fetchrow(
-        """
-        SELECT client_email, client_phone, payment_method, total_rub
-        FROM orders 
-        WHERE order_code = $1
-        """,
-        order_id
-    )
-    
+
+    # Разные заголовки для разных событий
+    if event == "created":
+        title = " <b>НОВЫЙ ЗАКАЗ</b> (ожидает оплаты)"
+    else:
+        title = "💳 <b>ЗАКАЗ ОПЛАЧЕН</b>"
+
     message = f"""
-💳 <b>НОВЫЙ ОПЛАЧЕННЫЙ ЗАКАЗ</b>
+{title}
 
- <b>Заказ:</b> {order_id}
+🔢 <b>Заказ:</b> {order_id}
 💰 <b>Сумма:</b> {amount_rub:,.2f} ₽
-📧 <b>Email:</b> {order['client_email']}
-📱 <b>Телефон:</b> {order['client_phone'] or 'не указан'}
-💳 <b>Оплата:</b> {order['payment_method']}
+📧 <b>Email:</b> {email or 'не указан'}
+📱 <b>Телефон:</b> {phone or 'не указан'}
+💳 <b>Оплата:</b> {method}
 
-<a href="https://shop.bytewizard.ru/ru/profile">👉 Посмотреть в админке</a>
-"""
-    
+<a href="https://shop.bytewizard.ru/ru/profile">👉 Проверить в админке</a>
+""".strip()
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
-        "chat_id": chat_id,
-        "text": message.strip(),
+        "chat_id": str(chat_id),
+        "text": message,
         "parse_mode": "HTML"
     }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            logger.info("✅ Уведомление отправлено в Telegram")
-        else:
-            logger.error(f"❌ Ошибка отправки в Telegram: {response.text}")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.info(f"✅ Уведомление ({event}) отправлено в Telegram")
+            else:
+                logger.error(f"❌ Telegram API error: {response.text}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки в Telegram: {e}")
 
 if __name__ == "__main__":
     import uvicorn
