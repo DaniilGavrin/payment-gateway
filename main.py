@@ -153,6 +153,9 @@ async def create_order(
         elif payload.payment_method == 'crypto':
             # ₿ CryptoCloud
             payment_url = await _create_cryptocloud_payment(payload)
+
+        elif payload.payment_method == 'stars':
+            payment_url = await _create_telegram_stars_payment(payload)
             
         elif payload.payment_method == 'invoice':
             # 📄 Для юр. лиц — пока заглушка (отправка счета на email)
@@ -291,6 +294,37 @@ async def _create_cryptocloud_payment(order: OrderCreateIn) -> str:
     else:
         logger.error(f"CryptoCloud error: {response.text}")
         raise Exception(f"CryptoCloud API error: {response.text[:200]}")
+    
+
+async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
+    """Создает инвойс в Telegram Stars и возвращает прямую ссылку на оплату"""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        raise Exception("TELEGRAM_BOT_TOKEN не задан в .env")
+    
+    # Конвертация рублей в звезды (1 звезда ≈ 1.5-2₽, настрой под свой курс)
+    # Для валюты XTR сумма указывается в ЦЕЛЫХ звездах (без копеек!)
+    stars_amount = max(1, int(order.total_rub / 2)) 
+    
+    url = f"https://api.telegram.org/bot{bot_token}/createInvoiceLink"
+    payload = {
+        "title": f"Заказ в ByteWizard #{order.order_id}",
+        "description": f"Оплата заказа на сумму {order.total_rub}₽",
+        "payload": order.order_id,  
+        "provider_token": "",       
+        "currency": "XTR",          
+        "prices": [{"label": "Стоимость", "amount": stars_amount}]
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload)
+        result = response.json()
+        
+    if result.get("ok"):
+        return result["result"] 
+    else:
+        logger.error(f"Telegram Stars error: {result}")
+        raise Exception(f"Telegram API error: {result.get('description')}")
 
 async def _send_invoice_email(order: OrderCreateIn):
     """Заглушка: отправка счета на email для юр. лиц"""
@@ -705,6 +739,47 @@ async def send_telegram_notifications(
                 logger.error(f"❌ Telegram API error (admin): {res.text}")
     except Exception as e:
         logger.error(f"❌ Ошибка отправки админу: {e}")
+
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook(request: Request, _db: bool = Depends(require_db_connection)):
+    """
+    Обработчик вебхуков от Telegram Bot API (successful_payment)
+    """
+    try:
+        data = await request.json()
+        
+        # Проверяем, что это успешная оплата
+        if "message" in data and "successful_payment" in data["message"]:
+            payment = data["message"]["successful_payment"]
+            order_id = payment["invoice_payload"]
+            
+            # Обновляем статус заказа в БД
+            await db.execute(
+                """
+                UPDATE orders 
+                SET status = 'paid', updated_at = NOW()
+                WHERE order_code = $1
+                """,
+                order_id
+            )
+            logger.info(f"✅ Заказ {order_id} успешно оплачен через Telegram Stars!")
+            
+            # Отправляем уведомление админу
+            # Сумму берем из БД, чтобы не передавать лишнее
+            order_total = await db.fetchval("SELECT total_rub FROM orders WHERE order_code = $1", order_id)
+            await send_telegram_notifications(
+                order_id=order_id,
+                amount_rub=order_total or 0,
+                event="paid",
+                telegram_id=str(data["message"]["chat"]["id"])
+            )
+            
+
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"❌ Ошибка Telegram webhook: {e}")
+        return {"ok": True}
 
 if __name__ == "__main__":
     import uvicorn

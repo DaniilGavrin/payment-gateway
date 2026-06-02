@@ -78,7 +78,7 @@ class OrderCreateIn(BaseModel):
     contact_email: str = Field(..., pattern=r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
     contact_phone: Optional[str] = Field(None, max_length=32)
     client_comment: Optional[str] = Field(None, max_length=1000)
-    payment_method: str = Field(..., pattern="^(card|sbp|crypto|invoice)$")
+    payment_method: str = Field(..., pattern="^(card|sbp|crypto|invoice|stars)$")
     locale: str = Field(default="ru", pattern="^(ru|en)$")
 
     telegram_id: Optional[str] = Field(None, max_length=64, description="ID пользователя Telegram")
