@@ -105,8 +105,9 @@ async def create_order(
                 order_code, client_email, client_phone, payment_method, 
                 total_rub, status, 
                 tg_id, telegram_username, telegram_first_name, telegram_last_name,
+                client_comment, 
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
             """,
             payload.order_id,
             payload.contact_email,
@@ -114,10 +115,11 @@ async def create_order(
             payload.payment_method,
             payload.total_rub,
             'pending',
-            tg_id_val,                      # <-- Сохраняем ID пользователя
-            payload.telegram_username,      # <-- Снимок юзернейма
-            payload.telegram_first_name,    # <-- Снимок имени
-            payload.telegram_last_name      # <-- Снимок фамилии
+            tg_id_val,                      
+            payload.telegram_username,      
+            payload.telegram_first_name,    
+            payload.telegram_last_name,
+            payload.client_comment          # <-- Добавили комментарий сюда
         )
         
         # 🔹 2. Сохраняем позиции заказа (таблица order_items)
