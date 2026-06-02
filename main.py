@@ -533,6 +533,75 @@ async def get_user_orders(
         logger.error(f"Ошибка получения заказов для tg_id {tg_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.get("/orders/{order_code}")
+async def get_order_details(
+    order_code: str,
+    tg_id: str = Query(..., description="Telegram ID пользователя для проверки прав"),
+    _: bool = Depends(require_db_connection)
+):
+    """
+    Возвращает полную информацию о конкретном заказе (включая items и config).
+    """
+    try:
+        tg_id_int = int(tg_id)
+        
+        # 1. Проверяем, что заказ существует и принадлежит этому пользователю
+        order_row = await db.fetchrow(
+            """
+            SELECT order_code, total_rub, status, payment_method, created_at, 
+                   client_email, client_phone, client_comment
+            FROM orders
+            WHERE order_code = $1 AND tg_id = $2
+            """,
+            order_code, tg_id_int
+        )
+        
+        if not order_row:
+            raise HTTPException(status_code=404, detail="Заказ не найден или доступ запрещен")
+        
+        # 2. Получаем все позиции этого заказа
+        items_rows = await db.fetch(
+            """
+            SELECT product_name, config, price_rub, delivery_days
+            FROM order_items
+            WHERE order_code = $1
+            """,
+            order_code
+        )
+        
+        # 3. Формируем красивый ответ
+        items = []
+        for row in items_rows:
+            items.append({
+                "product_name": row["product_name"],
+                "config": row["config"],  # Это уже dict (JSONB) благодаря asyncpg
+                "price_rub": float(row["price_rub"]),
+                "delivery_days": row["delivery_days"]
+            })
+        
+        return {
+            "success": True,
+            "order": {
+                "order_code": order_row["order_code"],
+                "total_rub": float(order_row["total_rub"]),
+                "status": order_row["status"],
+                "payment_method": order_row["payment_method"],
+                "created_at": order_row["created_at"].isoformat(),
+                "client_email": order_row["client_email"],
+                "client_phone": order_row["client_phone"],
+                "client_comment": order_row["client_comment"],
+                "items": items
+            }
+        }
+
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректный tg_id")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка получения деталей заказа {order_code}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 async def send_telegram_notifications(
     order_id: str,
     amount_rub: float,
