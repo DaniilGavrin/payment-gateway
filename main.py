@@ -1,5 +1,6 @@
 import asyncio
 import os
+from fastapi.params import Query
 import requests
 import jwt
 import logging
@@ -96,19 +97,27 @@ async def create_order(
     
     try:
         # 🔹 1. Сохраняем заказ в БД (таблица orders)
+        tg_id_val = int(payload.telegram_id) if payload.telegram_id else None
+
         await db.execute(
             """
             INSERT INTO orders (
                 order_code, client_email, client_phone, payment_method, 
-                total_rub, status, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                total_rub, status, 
+                tg_id, telegram_username, telegram_first_name, telegram_last_name,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
             """,
             payload.order_id,
             payload.contact_email,
             payload.contact_phone,
             payload.payment_method,
             payload.total_rub,
-            'pending'  # начальный статус
+            'pending',
+            tg_id_val,                      # <-- Сохраняем ID пользователя
+            payload.telegram_username,      # <-- Снимок юзернейма
+            payload.telegram_first_name,    # <-- Снимок имени
+            payload.telegram_last_name      # <-- Снимок фамилии
         )
         
         # 🔹 2. Сохраняем позиции заказа (таблица order_items)
@@ -481,6 +490,48 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         # Даже при ошибке возвращаем OK, чтобы Т-Банк не спамил
         return {"Status": "OK"}
 
+@app.get("/orders")
+async def get_user_orders(
+    tg_id: str = Query(..., description="Telegram ID пользователя"),
+    _: bool = Depends(require_db_connection)
+):
+    """
+    Возвращает список заказов конкретного пользователя.
+    Используется для страницы профиля.
+    """
+    try:
+        tg_id_int = int(tg_id)
+        
+        # Забираем заказы, отсортированные от новых к старым
+        rows = await db.fetch(
+            """
+            SELECT order_code, total_rub, status, payment_method, created_at
+            FROM orders
+            WHERE tg_id = $1
+            ORDER BY created_at DESC
+            """,
+            tg_id_int
+        )
+        
+        # Форматируем в удобный для фронта JSON
+        orders = [
+            {
+                "order_code": row["order_code"],
+                "total_rub": float(row["total_rub"]),
+                "status": row["status"],
+                "payment_method": row["payment_method"],
+                "created_at": row["created_at"].isoformat()
+            }
+            for row in rows
+        ]
+        
+        return {"success": True, "orders": orders}
+
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректный tg_id")
+    except Exception as e:
+        logger.error(f"Ошибка получения заказов для tg_id {tg_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 async def send_telegram_notifications(
     order_id: str,
