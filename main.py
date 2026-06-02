@@ -160,24 +160,23 @@ async def create_order(
         logger.info(f"   Email: {payload.contact_email}")
         
         try:
-            asyncio.create_task(
-                send_telegram_notifications(
-                    order_id=payload.order_id,
-                    amount_rub=payload.total_rub,
-                    event="created",
-                    payment_url=payment_url,  # Ссылка для клиента
-                    telegram_id=payload.telegram_id,
-                    telegram_username=payload.telegram_username,
-                    telegram_first_name=payload.telegram_first_name,
-                    email=payload.contact_email,
-                    phone=payload.contact_phone,
-                    method=payload.payment_method,
-                    comment=payload.client_comment
-                )
+            logger.info("📤 Начинаем отправку уведомлений в Telegram...")
+            await send_telegram_notifications(
+                order_id=payload.order_id,
+                amount_rub=payload.total_rub,
+                event="created",
+                payment_url=payment_url,
+                telegram_id=payload.telegram_id,
+                telegram_username=payload.telegram_username,
+                telegram_first_name=payload.telegram_first_name,
+                email=payload.contact_email,
+                phone=payload.contact_phone,
+                method=payload.payment_method,
+                comment=payload.client_comment
             )
-            logger.info("📤 Задача отправки уведомлений в Telegram создана")
+            logger.info("✅ Уведомления в Telegram успешно обработаны")
         except Exception as e:
-            logger.error(f"⚠️ Не удалось запустить задачу уведомлений: {e}")
+            logger.error(f"⚠️ Ошибка при отправке уведомлений: {e}", exc_info=True)
         
         return OrderCreateOut(
             success=True,
