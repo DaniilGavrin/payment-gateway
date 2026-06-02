@@ -160,21 +160,24 @@ async def create_order(
         logger.info(f"   Email: {payload.contact_email}")
         
         try:
-            # Создаём задачу явно
-            task = asyncio.create_task(
-                send_telegram_notification(
+            asyncio.create_task(
+                send_telegram_notifications(
                     order_id=payload.order_id,
                     amount_rub=payload.total_rub,
                     event="created",
+                    payment_url=payment_url,  # Ссылка для клиента
+                    telegram_id=payload.telegram_id,
+                    telegram_username=payload.telegram_username,
+                    telegram_first_name=payload.telegram_first_name,
                     email=payload.contact_email,
                     phone=payload.contact_phone,
-                    method=payload.payment_method
+                    method=payload.payment_method,
+                    comment=payload.client_comment
                 )
             )
-            logger.info(f"   ✅ Задача Telegram создана: {task}")
-            
+            logger.info("📤 Задача отправки уведомлений в Telegram создана")
         except Exception as e:
-            logger.error(f"   ❌ ОШИБКА при создании задачи: {e}", exc_info=True)
+            logger.error(f"⚠️ Не удалось запустить задачу уведомлений: {e}")
         
         return OrderCreateOut(
             success=True,
@@ -480,56 +483,107 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         return {"Status": "OK"}
 
 
-# 🔹 Вспомогательная функция для уведомлений
-async def send_telegram_notification(
-    order_id: str, 
-    amount_rub: float, 
-    event: str = "created",
-    email: str = "", 
-    phone: str = "", 
-    method: str = ""
+async def send_telegram_notifications(
+    order_id: str,
+    amount_rub: float,
+    event: str,  # "created" или "paid"
+    payment_url: str | None = None,
+    telegram_id: str | None = None,
+    telegram_username: str | None = None,
+    telegram_first_name: str | None = None,
+    email: str = "",
+    phone: str = "",
+    method: str = "",
+    comment: str = ""
 ):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
+    admin_chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
     
-    if not bot_token or not chat_id:
-        logger.warning("⚠️ TELEGRAM_BOT_TOKEN или CHAT_ID не заданы")
+    if not bot_token:
+        logger.warning("⚠️ TELEGRAM_BOT_TOKEN не задан")
         return
 
-    # Разные заголовки для разных событий
-    if event == "created":
-        title = " <b>НОВЫЙ ЗАКАЗ</b> (ожидает оплаты)"
-    else:
-        title = "💳 <b>ЗАКАЗ ОПЛАЧЕН</b>"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-    message = f"""
-{title}
+    # ========================================================================
+    # 1. УВЕДОМЛЕНИЕ ПОЛЬЗОВАТЕЛЮ (Только при создании заказа и если есть telegram_id)
+    # ========================================================================
+    if event == "created" and telegram_id and payment_url:
+        user_name = telegram_first_name or "Клиент"
+        user_msg = f"""
+Здравствуйте, {user_name}! 👋
+
+Мы получили ваш заказ <b>#{order_id}</b>.
+💰 <b>Сумма к оплате:</b> {amount_rub:,.2f} ₽
+
+Вы можете оплатить заказ, перейдя по ссылке ниже:
+👉 <a href="{payment_url}">Оплатить заказ</a>
+
+Если у вас есть вопросы, наша поддержка всегда на связи!
+        """.strip()
+
+        user_payload = {
+            "chat_id": str(telegram_id),
+            "text": user_msg,
+            "parse_mode": "HTML"
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(url, json=user_payload)
+                if res.status_code == 200:
+                    logger.info(f"✅ Уведомление отправлено пользователю (TG ID: {telegram_id})")
+                else:
+                    logger.warning(f"⚠️ Не удалось отправить пользователю: {res.text}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки пользователю: {e}")
+
+    # ========================================================================
+    # 2. УВЕДОМЛЕНИЕ АДМИНУ (Всегда)
+    # ========================================================================
+    if not admin_chat_id:
+        logger.warning("⚠️ TELEGRAM_ADMIN_CHAT_ID не задан")
+        return
+
+    if event == "created":
+        admin_title = "🛒 <b>НОВЫЙ ЗАКАЗ</b> (ожидает оплаты)"
+    else:
+        admin_title = "💳 <b>ЗАКАЗ ОПЛАЧЕН</b>"
+
+    admin_msg = f"""
+{admin_title}
 
 🔢 <b>Заказ:</b> {order_id}
 💰 <b>Сумма:</b> {amount_rub:,.2f} ₽
-📧 <b>Email:</b> {email or 'не указан'}
-📱 <b>Телефон:</b> {phone or 'не указан'}
-💳 <b>Оплата:</b> {method}
+💳 <b>Оплата:</b> {method or 'не указана'}
+
+👤 <b>Данные клиента:</b>
+• ID Telegram: <code>{telegram_id or 'не указан'}</code>
+• Username: @{telegram_username or 'не указан'}
+• Имя: {telegram_first_name or 'не указано'}
+• Email: {email or 'не указан'}
+• Телефон: {phone or 'не указан'}
+
+📝 <b>Комментарий:</b> {comment or 'нет'}
 
 <a href="https://shop.bytewizard.ru/ru/profile">👉 Проверить в админке</a>
-""".strip()
+    """.strip()
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": str(chat_id),
-        "text": message,
+    admin_payload = {
+        "chat_id": str(admin_chat_id),
+        "text": admin_msg,
         "parse_mode": "HTML"
     }
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, json=payload)
-            if response.status_code == 200:
-                logger.info(f"✅ Уведомление ({event}) отправлено в Telegram")
+            res = await client.post(url, json=admin_payload)
+            if res.status_code == 200:
+                logger.info(f"✅ Уведомление админу ({event}) успешно отправлено")
             else:
-                logger.error(f"❌ Telegram API error: {response.text}")
+                logger.error(f"❌ Telegram API error (admin): {res.text}")
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки в Telegram: {e}")
+        logger.error(f"❌ Ошибка отправки админу: {e}")
 
 if __name__ == "__main__":
     import uvicorn

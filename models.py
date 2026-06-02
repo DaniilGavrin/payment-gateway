@@ -81,6 +81,11 @@ class OrderCreateIn(BaseModel):
     payment_method: str = Field(..., pattern="^(card|sbp|crypto|invoice)$")
     locale: str = Field(default="ru", pattern="^(ru|en)$")
 
+    telegram_id: Optional[str] = Field(None, max_length=64, description="ID пользователя Telegram")
+    telegram_username: Optional[str] = Field(None, max_length=64, description="Username в Telegram")
+    telegram_first_name: Optional[str] = Field(None, max_length=128, description="Имя в Telegram")
+    telegram_last_name: Optional[str] = Field(None, max_length=128, description="Фамилия в Telegram")
+
     @field_validator('items')
     @classmethod
     def validate_items_total(cls, v, values):
