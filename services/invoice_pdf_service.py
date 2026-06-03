@@ -1,33 +1,48 @@
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm, cm
-from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
-)
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
 import logging
+import os
 from datetime import datetime
 from typing import Dict, Any
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+
 class InvoicePDFService:
     def __init__(self):
-        # Регистрируем шрифт с поддержкой кириллицы (DejaVu Sans)
+        # По умолчанию используем стандартные шрифты
+        self.font_normal = 'Helvetica'
+        self.font_bold = 'Helvetica-Bold'
+        
+        # 🔹 Пытаемся зарегистрировать шрифты DejaVu для кириллицы
         try:
-            pdfmetrics.registerFont(TTFont('DejaVuSans', 'DejaVuSans.ttf'))
-            pdfmetrics.registerFont(TTFont('DejaVuSans-Bold', 'DejaVuSans-Bold.ttf'))
-            self.font_normal = 'DejaVuSans'
-            self.font_bold = 'DejaVuSans-Bold'
-        except:
-            # Fallback если шрифты не найдены
-            self.font_normal = 'Helvetica'
-            self.font_bold = 'Helvetica-Bold'
-            logger.warning("⚠️ DejaVu fonts not found, using Helvetica")
+            # Ищем шрифты в папке fonts/
+            base_dir = Path(__file__).parent.parent
+            fonts_dir = base_dir / "fonts"
+            
+            regular_font = fonts_dir / "DejaVuSans.ttf"
+            bold_font = fonts_dir / "DejaVuSans-Bold.ttf"
+            
+            if regular_font.exists() and bold_font.exists():
+                pdfmetrics.registerFont(TTFont('DejaVuSans', str(regular_font)))
+                pdfmetrics.registerFont(TTFont('DejaVuSans-Bold', str(bold_font)))
+                self.font_normal = 'DejaVuSans'
+                self.font_bold = 'DejaVuSans-Bold'
+                logger.info("✅ DejaVu fonts loaded successfully")
+            else:
+                logger.warning(f"⚠️ DejaVu fonts not found in {fonts_dir}")
+                logger.warning("⚠️ Using Helvetica (Cyrillic will NOT work)")
+        except Exception as e:
+            logger.error(f"❌ Font loading error: {e}")
+            logger.error("⚠️ Using Helvetica (Cyrillic will NOT work)")
 
     def generate_invoice_pdf(
         self,
@@ -51,7 +66,7 @@ class InvoicePDFService:
         elements = []
         styles = getSampleStyleSheet()
         
-        # Кастомные стили
+        # 🔹 Кастомные стили с неоновыми цветами
         styles.add(ParagraphStyle(
             name='NeoPurple',
             parent=styles['Normal'],
@@ -65,18 +80,17 @@ class InvoicePDFService:
             name='SmallBold',
             parent=styles['Normal'],
             fontName=self.font_bold,
-            fontSize=8,
+            fontSize=9,
             textColor=colors.HexColor('#8b5cf6'),
-            spaceAfter=5
+            spaceAfter=6
         ))
         
         # ==================== ШАПКА ====================
-        # Логотип/Название
         elements.append(Paragraph("ByteWizard", styles['NeoPurple']))
         
         # Инфо о счёте (справа)
         header_data = [
-            [f"СЧЁ № {invoice_number}", f"от {datetime.now().strftime('%d.%m.%Y')}"]
+            [f"СЧЁТ № {invoice_number}", f"от {datetime.now().strftime('%d.%m.%Y')}"]
         ]
         header_table = Table(header_data, colWidths=[100*mm, 60*mm])
         header_table.setStyle(TableStyle([
@@ -91,11 +105,19 @@ class InvoicePDFService:
         # ==================== ПРОДАВЕЦ ====================
         elements.append(Paragraph("Продавец:", styles['SmallBold']))
         seller_info = [
-            [seller.get('name', '')],
-            [f"ИНН: {seller.get('inn', '')}"],
-            [f"Адрес: {seller.get('address', '')}"],
-            [f"Email: {seller.get('email', '')}"],
+            [seller.get('name') or "Не указано"],
         ]
+        if seller.get('inn'):
+            seller_info.append([f"ИНН: {seller['inn']}"])
+        if seller.get('ogrn'):
+            seller_info.append([f"ОГРН: {seller['ogrn']}"])
+        if seller.get('address'):
+            seller_info.append([f"Адрес: {seller['address']}"])
+        if seller.get('email'):
+            seller_info.append([f"Email: {seller['email']}"])
+        if seller.get('phone'):
+            seller_info.append([f"Тел: {seller['phone']}"])
+        
         seller_table = Table(seller_info, colWidths=[150*mm])
         seller_table.setStyle(TableStyle([
             ('FONTNAME', (0, 0), (-1, -1), self.font_normal),
@@ -104,15 +126,19 @@ class InvoicePDFService:
             ('PADDING', (0, 0), (-1, -1), 3),
         ]))
         elements.append(seller_table)
-        elements.append(Spacer(1, 5*mm))
+        elements.append(Spacer(1, 8*mm))
         
         # ==================== ПОКУПАТЕЛЬ ====================
         elements.append(Paragraph("Покупатель:", styles['SmallBold']))
         
-        # Определяем имя:优先 компания, если нет — физ. лицо
-        buyer_name = buyer.get('company_name') or f"{buyer.get('first_name', '')} {buyer.get('last_name', '')}".strip()
+        # 🔹 ИСПРАВЛЕНО: Корректное определение имени покупателя
+        buyer_name = buyer.get('company_name')
+        if not buyer_name:
+            first = buyer.get('first_name') or ''
+            last = buyer.get('last_name') or ''
+            buyer_name = f"{last} {first}".strip() or "Клиент"
         
-        buyer_info = [[buyer_name or "Клиент"]]
+        buyer_info = [[buyer_name]]
         
         if buyer.get('inn'):
             buyer_info.append([f"ИНН: {buyer['inn']}"])
@@ -120,8 +146,8 @@ class InvoicePDFService:
             buyer_info.append([f"КПП: {buyer['kpp']}"])
         if buyer.get('legal_address'):
             buyer_info.append([f"Адрес: {buyer['legal_address']}"])
-            
-        buyer_info.append([f"Email: {buyer.get('email', '')}"])
+        if buyer.get('email'):
+            buyer_info.append([f"Email: {buyer['email']}"])
         if buyer.get('phone'):
             buyer_info.append([f"Телефон: {buyer['phone']}"])
         
@@ -195,34 +221,60 @@ class InvoicePDFService:
         
         # ==================== БАНКОВСКИЕ РЕКВИЗИТЫ ====================
         elements.append(Paragraph("Банковские реквизиты:", styles['SmallBold']))
-        bank_info = [
-            [f"Банк: {seller.get('bank_name', '')}"],
-            [f"Расчётный счёт: {seller.get('bank_account', '')}"],
-            [f"БИК: {seller.get('bank_bik', '')}"],
-            [f"Корр. счёт: {seller.get('bank_corr', '')}"] if seller.get('bank_corr') else [],
-        ]
-        bank_table = Table(bank_info, colWidths=[150*mm])
-        bank_table.setStyle(TableStyle([
-            ('FONTNAME', (0, 0), (-1, -1), self.font_normal),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f9f9f9')),
-            ('PADDING', (0, 0), (-1, -1), 5),
-            ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.grey),
-        ]))
-        elements.append(bank_table)
+        bank_info = []
+        
+        if seller.get('bank_name'):
+            bank_info.append([f"Банк: {seller['bank_name']}"])
+        if seller.get('bank_account'):
+            bank_info.append([f"Расчётный счёт: {seller['bank_account']}"])
+        if seller.get('bank_bik'):
+            bank_info.append([f"БИК: {seller['bank_bik']}"])
+        if seller.get('bank_corr'):
+            bank_info.append([f"Корр. счёт: {seller['bank_corr']}"])
+        
+        # 🔹 Если реквизиты есть — рисуем таблицу
+        if bank_info:
+            bank_table = Table(bank_info, colWidths=[150*mm])
+            bank_table.setStyle(TableStyle([
+                ('FONTNAME', (0, 0), (-1, -1), self.font_normal),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f9f9f9')),
+                ('PADDING', (0, 0), (-1, -1), 5),
+                ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.grey),
+            ]))
+            elements.append(bank_table)
         
         # ==================== ПОДВАЛ ====================
-        elements.append(Spacer(1, 15*mm))
+        elements.append(Spacer(1, 20*mm))
+        
+        footer_style = ParagraphStyle(
+            'FooterStyle',
+            parent=styles['Normal'],
+            fontName=self.font_normal,
+            fontSize=9
+        )
+        
+        director_name = seller.get('director') or "____________"
+        accountant_name = seller.get('accountant') or "____________"
+        
         footer_text = f"""
-        <b>Руководитель</b> ____________________ / {seller.get('director', '')} /<br/><br/>
-        <b>Главный бухгалтер</b> ____________________ / {seller.get('accountant', '____________') or '____________'} /
+        <b>Руководитель</b> ____________________ / {director_name} /<br/><br/>
+        <b>Главный бухгалтер</b> ____________________ / {accountant_name} /
         """
-        elements.append(Paragraph(footer_text, styles['Normal']))
+        elements.append(Paragraph(footer_text, footer_style))
         
         elements.append(Spacer(1, 10*mm))
+        
+        footer_note = ParagraphStyle(
+            'FooterNote',
+            parent=styles['Normal'],
+            fontName=self.font_normal,
+            fontSize=8,
+            textColor=colors.grey
+        )
         elements.append(Paragraph(
             "<i>Счёт действителен в течение 3 банковских дней.</i>",
-            ParagraphStyle('Footer', parent=styles['Normal'], fontSize=8, textColor=colors.grey)
+            footer_note
         ))
         
         # ==================== ГЕНЕРАЦИЯ ====================
