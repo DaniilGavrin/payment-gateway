@@ -1,6 +1,6 @@
 import asyncio
 import os
-from fastapi.params import Query
+from fastapi.params import Path, Query
 import requests
 import jwt
 import logging
@@ -28,8 +28,13 @@ from services.webhook_service import is_webhook_processed, process_payment_webho
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
+from services.invoice_service import InvoiceService
+from services.email_service import EmailService
+
+invoice_service = InvoiceService()
+email_service = EmailService()
 
 load_dotenv()
 
@@ -158,9 +163,9 @@ async def create_order(
             payment_url = await _create_telegram_stars_payment(payload)
             
         elif payload.payment_method == 'invoice':
-            # 📄 Для юр. лиц — пока заглушка (отправка счета на email)
-            await _send_invoice_email(payload)
-            payment_url = f"/profile?order={payload.order_id}&status=invoice_sent"
+            # 📄 Генерация и отправка счёта
+            invoice_url = await _generate_and_send_invoice(payload, _db)
+            payment_url = invoice_url  # Возвращаем URL на PDF
         
         if not payment_url:
             raise HTTPException(status_code=502, detail="Не удалось создать ссылку на оплату")
@@ -326,12 +331,85 @@ async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
         logger.error(f"Telegram Stars error: {result}")
         raise Exception(f"Telegram API error: {result.get('description')}")
 
-async def _send_invoice_email(order: OrderCreateIn):
-    """Заглушка: отправка счета на email для юр. лиц"""
-    # Тут можно подключить SMTP и отправить письмо с реквизитами
-    logger.info(f"📧 Отправка счета для {order.contact_email} на сумму {order.total_rub}₽")
-    # Пример: await send_email(to=order.contact_email, subject=f"Счет #{order.order_id}", ...)
-    pass
+async def _generate_and_send_invoice(order: OrderCreateIn, _db) -> str:
+    """
+    Генерирует PDF-счёт, сохраняет в БД, отправляет в Telegram и на email.
+    Возвращает URL для скачивания PDF.
+    """
+    try:
+        # 1. Генерируем номер счёта
+        invoice_number = await invoice_service.generate_invoice_number(_db)
+        
+        # 2. Формируем данные заказа
+        order_data = {
+            "items": [item.dict() for item in order.items],
+            "total_rub": order.total_rub,
+            "client_comment": order.client_comment,
+        }
+        
+        # 3. Данные покупателя (пока только из заказа, позже добавим реквизиты)
+        buyer_data = {
+            "name": f"{order.telegram_first_name or ''} {order.telegram_last_name or ''}".strip() or "Клиент",
+            "email": order.contact_email,
+            "phone": order.contact_phone,
+            "company_name": None,  # Позже добавим поле в форму
+            "inn": None,
+        }
+        
+        # 4. Генерируем PDF
+        pdf_content = await invoice_service.generate_invoice_pdf(
+            invoice_number=invoice_number,
+            order=order_data,
+            buyer=buyer_data
+        )
+        
+        # 5. Сохраняем PDF локально
+        pdf_url = await invoice_service.save_invoice(
+            invoice_number=invoice_number,
+            pdf_content=pdf_content
+        )
+        
+        # 6. Сохраняем в БД
+        await _db.execute(
+            """
+            INSERT INTO invoices (invoice_number, order_code, pdf_url, status)
+            VALUES ($1, $2, $3, 'generated')
+            """,
+            invoice_number,
+            order.order_id,
+            pdf_url
+        )
+        
+        # 7. Отправляем PDF в Telegram (пользователю и админу)
+        await send_invoice_to_telegram(
+            invoice_number=invoice_number,
+            pdf_content=pdf_content,
+            telegram_id=order.telegram_id,
+            total_rub=order.total_rub
+        )
+        
+        # 8. Отправляем PDF на email клиента
+        await email_service.send_invoice_email(
+            to_email=order.contact_email,
+            invoice_number=invoice_number,
+            pdf_content=pdf_content,
+            total_rub=order.total_rub
+        )
+        
+        # 9. Обновляем статус в БД
+        await _db.execute(
+            "UPDATE invoices SET status = 'sent', sent_at = NOW() WHERE invoice_number = $1",
+            invoice_number
+        )
+        
+        logger.info(f"✅ Счёт {invoice_number} создан и отправлен")
+        
+        # 10. Возвращаем полный URL для фронтенда
+        return f"https://pay.bytewizard.ru{pdf_url}"
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания счёта: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Не удалось создать счёт")
 
 @app.get("/orders/check")
 async def check_orders():
@@ -704,6 +782,73 @@ async def cancel_order(
     except Exception as e:
         logger.error(f"❌ Ошибка отмены заказа {order_code}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/invoices/{filename}")
+async def get_invoice_file(filename: str):
+    """Отдаёт PDF-файл счёта"""
+    filepath = Path("static/invoices") / filename
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    
+    return FileResponse(
+        filepath,
+        media_type="application/pdf",
+        filename=filename
+    )
+
+async def send_invoice_to_telegram(
+    invoice_number: str,
+    pdf_content: bytes,
+    telegram_id: str | None,
+    total_rub: float
+):
+    """Отправляет PDF-счёт в Telegram пользователю и админу"""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    admin_chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
+    
+    if not bot_token:
+        logger.warning("⚠️ TELEGRAM_BOT_TOKEN не задан")
+        return
+    
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    
+    # Отправка пользователю
+    if telegram_id:
+        try:
+            files = {
+                "document": (f"invoice_{invoice_number}.pdf", pdf_content, "application/pdf")
+            }
+            data = {
+                "chat_id": str(telegram_id),
+                "caption": f"📄 Счёт № {invoice_number} на сумму {total_rub:,.2f} ₽\n\nОплатите по реквизитам в счёте."
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                res = await client.post(url, data=data, files=files)
+                if res.status_code == 200:
+                    logger.info(f"✅ Счёт отправлен пользователю (TG ID: {telegram_id})")
+                else:
+                    logger.warning(f"⚠️ Не удалось отправить пользователю: {res.text}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки пользователю: {e}")
+    
+    # Отправка админу
+    if admin_chat_id:
+        try:
+            files = {
+                "document": (f"invoice_{invoice_number}.pdf", pdf_content, "application/pdf")
+            }
+            data = {
+                "chat_id": str(admin_chat_id),
+                "caption": f"📄 НОВЫЙ СЧЁТ № {invoice_number}\n💰 Сумма: {total_rub:,.2f} ₽"
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                res = await client.post(url, data=data, files=files)
+                if res.status_code == 200:
+                    logger.info(f"✅ Счёт отправлен админу")
+                else:
+                    logger.error(f"❌ Не удалось отправить админу: {res.text}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки админу: {e}")
 
 async def send_telegram_notifications(
     order_id: str,
