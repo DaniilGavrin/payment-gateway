@@ -1,4 +1,5 @@
 import asyncio
+from io import BytesIO
 import os
 from fastapi.params import Path, Query
 import requests
@@ -28,18 +29,35 @@ from services.webhook_service import is_webhook_processed, process_payment_webho
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 
 from services.invoice_service import InvoiceService
 from services.email_service import EmailService
+from services.invoice_pdf_service import InvoicePDFService
 
 invoice_service = InvoiceService()
 email_service = EmailService()
+invoice_pdf_service = InvoicePDFService()
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET")
+
+COMPANY_REQUISITES = {
+    "name": os.getenv("COMPANY_NAME", "ИП Гаврин Даниил Никитич"),
+    "inn": os.getenv("COMPANY_INN", "434584462396"),
+    "ogrn": os.getenv("COMPANY_OGRN"),
+    "address": os.getenv("COMPANY_ADDRESS"),
+    "email": os.getenv("COMPANY_EMAIL"),
+    "phone": os.getenv("COMPANY_PHONE"),
+    "director": os.getenv("COMPANY_DIRECTOR", "Гаврин Д.Н."),
+    "accountant": os.getenv("COMPANY_ACCOUNTANT"),
+    "bank_name": os.getenv("COMPANY_BANK_NAME", "ПАО Сбербанк"),
+    "bank_account": os.getenv("COMPANY_BANK_ACCOUNT"),
+    "bank_bik": os.getenv("COMPANY_BANK_BIK"),
+    "bank_corr": os.getenv("COMPANY_BANK_CORR"),
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -333,79 +351,74 @@ async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
 
 async def _generate_and_send_invoice(order: OrderCreateIn, _db) -> str:
     """
-    Генерирует PDF-счёт, сохраняет в БД, отправляет в Telegram и на email.
+    Генерирует PDF, сохраняет данные в БД, отправляет в Telegram и на email.
     Возвращает URL для скачивания PDF.
     """
     try:
         # 1. Генерируем номер счёта
-        invoice_number = await invoice_service.generate_invoice_number(_db)
+        invoice_number = await _db.fetchval(
+            "SELECT COALESCE(MAX(invoice_number), 'INV-0000') FROM invoices"
+        )
+        # Увеличиваем номер (INV-0001 -> INV-0002)
+        prefix = "INV-"
+        num = int(invoice_number.split("-")[1]) + 1
+        invoice_number = f"{prefix}{num:04d}"
         
-        # 2. Формируем данные заказа
-        order_data = {
-            "items": [item.dict() for item in order.items],
-            "total_rub": order.total_rub,
-            "client_comment": order.client_comment,
-        }
-        
-        # 3. Данные покупателя (пока только из заказа, позже добавим реквизиты)
+        # 2. Данные покупателя
         buyer_data = {
-            "name": f"{order.telegram_first_name or ''} {order.telegram_last_name or ''}".strip() or "Клиент",
+            "first_name": order.telegram_first_name,
+            "last_name": order.telegram_last_name,
             "email": order.contact_email,
             "phone": order.contact_phone,
-            "company_name": None,  # Позже добавим поле в форму
+            "company_name": None,  # Позже добавим в форму
             "inn": None,
         }
         
-        # 4. Генерируем PDF
-        pdf_content = await invoice_service.generate_invoice_pdf(
+        # 3. Генерируем PDF (для отправки)
+        pdf_bytes = invoice_pdf_service.generate_invoice_pdf(
             invoice_number=invoice_number,
-            order=order_data,
+            order={
+                "items": [item.dict() for item in order.items],
+                "total_rub": order.total_rub,
+            },
+            seller=COMPANY_REQUISITES,
             buyer=buyer_data
         )
         
-        # 5. Сохраняем PDF локально
-        pdf_url = await invoice_service.save_invoice(
-            invoice_number=invoice_number,
-            pdf_content=pdf_content
-        )
-        
-        # 6. Сохраняем в БД
+        # 4. Сохраняем ДАННЫЕ в БД (не PDF!)
         await _db.execute(
             """
-            INSERT INTO invoices (invoice_number, order_code, pdf_url, status)
-            VALUES ($1, $2, $3, 'generated')
+            INSERT INTO invoices (
+                invoice_number, order_code, buyer_data, seller_data, 
+                items_data, total_rub, status
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'generated')
             """,
             invoice_number,
             order.order_id,
-            pdf_url
+            json.dumps(buyer_data),
+            json.dumps(COMPANY_REQUISITES),
+            json.dumps([item.dict() for item in order.items]),
+            order.total_rub
         )
         
-        # 7. Отправляем PDF в Telegram (пользователю и админу)
+        # 5. Отправляем PDF в Telegram (как файл)
         await send_invoice_to_telegram(
             invoice_number=invoice_number,
-            pdf_content=pdf_content,
+            pdf_bytes=pdf_bytes,
             telegram_id=order.telegram_id,
             total_rub=order.total_rub
         )
         
-        # 8. Отправляем PDF на email клиента
+        # 6. Отправляем PDF на email (как вложение)
         await email_service.send_invoice_email(
             to_email=order.contact_email,
             invoice_number=invoice_number,
-            pdf_content=pdf_content,
+            pdf_bytes=pdf_bytes,
             total_rub=order.total_rub
         )
         
-        # 9. Обновляем статус в БД
-        await _db.execute(
-            "UPDATE invoices SET status = 'sent', sent_at = NOW() WHERE invoice_number = $1",
-            invoice_number
-        )
-        
-        logger.info(f"✅ Счёт {invoice_number} создан и отправлен")
-        
-        # 10. Возвращаем полный URL для фронтенда
-        return f"https://pay.bytewizard.ru{pdf_url}"
+        # 7. Возвращаем URL для скачивания
+        return f"https://pay.bytewizard.ru/invoice/{invoice_number}/download"
         
     except Exception as e:
         logger.error(f"❌ Ошибка создания счёта: {e}", exc_info=True)
@@ -783,26 +796,94 @@ async def cancel_order(
         logger.error(f"❌ Ошибка отмены заказа {order_code}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/invoices/{filename}")
-async def get_invoice_file(filename: str):
-    """Отдаёт PDF-файл счёта"""
-    filepath = Path("static/invoices") / filename
-    if not filepath.exists():
+@app.get("/invoice/{invoice_number}/download")
+async def download_invoice(
+    invoice_number: str,
+    _db: bool = Depends(require_db_connection)
+):
+    """Генерирует PDF на лету и отдаёт клиенту"""
+    
+    # 1. Получаем данные из БД
+    invoice_data = await _db.fetchrow(
+        """
+        SELECT buyer_data, seller_data, items_data, total_rub
+        FROM invoices
+        WHERE invoice_number = $1
+        """,
+        invoice_number
+    )
+    
+    if not invoice_data:
         raise HTTPException(status_code=404, detail="Invoice not found")
     
-    return FileResponse(
-        filepath,
+    # 2. Генерируем PDF
+    pdf_bytes = invoice_pdf_service.generate_invoice_pdf(
+        invoice_number=invoice_number,
+        order={
+            "items": invoice_data["items_data"],
+            "total_rub": float(invoice_data["total_rub"])
+        },
+        seller=invoice_data["seller_data"],
+        buyer=invoice_data["buyer_data"]
+    )
+    
+    # 3. Отдаём как файл
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
         media_type="application/pdf",
-        filename=filename
+        headers={
+            "Content-Disposition": f"attachment; filename=invoice_{invoice_number}.pdf"
+        }
+    )
+
+
+# ========================================================================
+# 🔹 Эндпоинт для просмотра PDF в браузере (inline)
+# ========================================================================
+@app.get("/invoice/{invoice_number}/view")
+async def view_invoice(
+    invoice_number: str,
+    _db: bool = Depends(require_db_connection)
+):
+    """Открывает PDF в браузере (встроенный просмотр)"""
+    
+    invoice_data = await _db.fetchrow(
+        """
+        SELECT buyer_data, seller_data, items_data, total_rub
+        FROM invoices
+        WHERE invoice_number = $1
+        """,
+        invoice_number
+    )
+    
+    if not invoice_data:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    
+    pdf_bytes = invoice_pdf_service.generate_invoice_pdf(
+        invoice_number=invoice_number,
+        order={
+            "items": invoice_data["items_data"],
+            "total_rub": float(invoice_data["total_rub"])
+        },
+        seller=invoice_data["seller_data"],
+        buyer=invoice_data["buyer_data"]
+    )
+    
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"inline; filename=invoice_{invoice_number}.pdf"
+        }
     )
 
 async def send_invoice_to_telegram(
     invoice_number: str,
-    pdf_content: bytes,
+    pdf_bytes: bytes,
     telegram_id: str | None,
     total_rub: float
 ):
-    """Отправляет PDF-счёт в Telegram пользователю и админу"""
+    """Отправляет PDF-счёт в Telegram как файл"""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     admin_chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
     
@@ -812,15 +893,25 @@ async def send_invoice_to_telegram(
     
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
     
+    # Текст сообщения
+    caption = f"""
+📄 <b>СЧЁТ № {invoice_number}</b>
+💰 <b>Сумма:</b> {total_rub:,.2f} ₽
+
+Оплатите по реквизитам в счёте.
+После оплаты мы начнём работу над заказом.
+""".strip()
+    
     # Отправка пользователю
     if telegram_id:
         try:
             files = {
-                "document": (f"invoice_{invoice_number}.pdf", pdf_content, "application/pdf")
+                "document": (f"invoice_{invoice_number}.pdf", pdf_bytes, "application/pdf")
             }
             data = {
                 "chat_id": str(telegram_id),
-                "caption": f"📄 Счёт № {invoice_number} на сумму {total_rub:,.2f} ₽\n\nОплатите по реквизитам в счёте."
+                "caption": caption,
+                "parse_mode": "HTML"
             }
             async with httpx.AsyncClient(timeout=30.0) as client:
                 res = await client.post(url, data=data, files=files)
@@ -835,11 +926,12 @@ async def send_invoice_to_telegram(
     if admin_chat_id:
         try:
             files = {
-                "document": (f"invoice_{invoice_number}.pdf", pdf_content, "application/pdf")
+                "document": (f"invoice_{invoice_number}.pdf", pdf_bytes, "application/pdf")
             }
             data = {
                 "chat_id": str(admin_chat_id),
-                "caption": f"📄 НОВЫЙ СЧЁТ № {invoice_number}\n💰 Сумма: {total_rub:,.2f} ₽"
+                "caption": f"📄 <b>НОВЫЙ СЧЁТ</b> № {invoice_number}\n💰 {total_rub:,.2f} ₽",
+                "parse_mode": "HTML"
             }
             async with httpx.AsyncClient(timeout=30.0) as client:
                 res = await client.post(url, data=data, files=files)
