@@ -652,9 +652,10 @@ async def cancel_order(
         tg_id_int = int(payload.get("tg_id", 0))
         
         # 1. Получаем данные заказа для проверки прав и для уведомлений
+        # 🔹 ИСПРАВЛЕНО: telegram_id заменено на tg_id
         order_row = await db.fetchrow(
             """
-            SELECT status, total_rub, telegram_id, telegram_first_name
+            SELECT status, total_rub, tg_id, telegram_first_name
             FROM orders
             WHERE order_code = $1 AND tg_id = $2
             """,
@@ -684,7 +685,8 @@ async def cancel_order(
                 order_id=order_code,
                 amount_rub=float(order_row["total_rub"]),
                 event="cancelled",
-                telegram_id=str(order_row["telegram_id"]) if order_row["telegram_id"] else None,
+                # 🔹 ИСПРАВЛЕНО: берем значение из правильной колонки tg_id
+                telegram_id=str(order_row["tg_id"]) if order_row["tg_id"] else None,
                 telegram_first_name=order_row["telegram_first_name"]
             )
         except Exception as e:
