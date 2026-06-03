@@ -26,7 +26,7 @@ from services.webhook_service import is_webhook_processed, process_payment_webho
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse, Response
 
 from services.email_service import EmailService
 from services.invoice_pdf_service import InvoicePDFService
@@ -750,7 +750,7 @@ async def download_invoice(
     invoice_number: str,
     _db: bool = Depends(require_db_connection)
 ):
-    """Генерирует PDF на лету и отдаёт клиенту"""
+    """Генерирует PDF и отдаёт клиенту"""
     
     invoice_data = await db.fetchrow(
         """
@@ -774,20 +774,22 @@ async def download_invoice(
         buyer=invoice_data["buyer_data"]
     )
     
-    return StreamingResponse(
-        BytesIO(pdf_bytes),
+    # 🔹 ИСПРАВЛЕНО: используем Response вместо StreamingResponse
+    return Response(
+        content=pdf_bytes,
         media_type="application/pdf",
         headers={
             "Content-Disposition": f"attachment; filename=invoice_{invoice_number}.pdf"
         }
     )
 
+
 @app.get("/invoice/{invoice_number}/view")
 async def view_invoice(
     invoice_number: str,
     _db: bool = Depends(require_db_connection)
 ):
-    """Открывает PDF в браузере (встроенный просмотр)"""
+    """Открывает PDF в браузере"""
     
     invoice_data = await db.fetchrow(
         """
@@ -811,8 +813,9 @@ async def view_invoice(
         buyer=invoice_data["buyer_data"]
     )
     
-    return StreamingResponse(
-        BytesIO(pdf_bytes),
+    # 🔹 ИСПРАВЛЕНО: используем Response вместо StreamingResponse
+    return Response(
+        content=pdf_bytes,
         media_type="application/pdf",
         headers={
             "Content-Disposition": f"inline; filename=invoice_{invoice_number}.pdf"
