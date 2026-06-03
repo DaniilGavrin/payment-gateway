@@ -31,11 +31,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 
-from services.invoice_service import InvoiceService
+
 from services.email_service import EmailService
 from services.invoice_pdf_service import InvoicePDFService
 
-invoice_service = InvoiceService()
 email_service = EmailService()
 invoice_pdf_service = InvoicePDFService()
 
