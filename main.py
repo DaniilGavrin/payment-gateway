@@ -764,17 +764,20 @@ async def download_invoice(
     if not invoice_data:
         raise HTTPException(status_code=404, detail="Invoice not found")
     
+    buyer_data = json.loads(invoice_data["buyer_data"]) if isinstance(invoice_data["buyer_data"], str) else invoice_data["buyer_data"]
+    seller_data = json.loads(invoice_data["seller_data"]) if isinstance(invoice_data["seller_data"], str) else invoice_data["seller_data"]
+    items_data = json.loads(invoice_data["items_data"]) if isinstance(invoice_data["items_data"], str) else invoice_data["items_data"]
+    
     pdf_bytes = invoice_pdf_service.generate_invoice_pdf(
         invoice_number=invoice_number,
         order={
-            "items": invoice_data["items_data"],
+            "items": items_data,
             "total_rub": float(invoice_data["total_rub"])
         },
-        seller=invoice_data["seller_data"],
-        buyer=invoice_data["buyer_data"]
+        seller=seller_data,
+        buyer=buyer_data
     )
     
-    # 🔹 ИСПРАВЛЕНО: используем Response вместо StreamingResponse
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -803,17 +806,21 @@ async def view_invoice(
     if not invoice_data:
         raise HTTPException(status_code=404, detail="Invoice not found")
     
+
+    buyer_data = json.loads(invoice_data["buyer_data"]) if isinstance(invoice_data["buyer_data"], str) else invoice_data["buyer_data"]
+    seller_data = json.loads(invoice_data["seller_data"]) if isinstance(invoice_data["seller_data"], str) else invoice_data["seller_data"]
+    items_data = json.loads(invoice_data["items_data"]) if isinstance(invoice_data["items_data"], str) else invoice_data["items_data"]
+    
     pdf_bytes = invoice_pdf_service.generate_invoice_pdf(
         invoice_number=invoice_number,
         order={
-            "items": invoice_data["items_data"],
+            "items": items_data,
             "total_rub": float(invoice_data["total_rub"])
         },
-        seller=invoice_data["seller_data"],
-        buyer=invoice_data["buyer_data"]
+        seller=seller_data,
+        buyer=buyer_data
     )
     
-    # 🔹 ИСПРАВЛЕНО: используем Response вместо StreamingResponse
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
