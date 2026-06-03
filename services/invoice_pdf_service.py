@@ -108,12 +108,23 @@ class InvoicePDFService:
         
         # ==================== ПОКУПАТЕЛЬ ====================
         elements.append(Paragraph("Покупатель:", styles['SmallBold']))
+        
+        # Определяем имя:优先 компания, если нет — физ. лицо
         buyer_name = buyer.get('company_name') or f"{buyer.get('first_name', '')} {buyer.get('last_name', '')}".strip()
-        buyer_info = [
-            [buyer_name or "Клиент"],
-            [f"Email: {buyer.get('email', '')}"],
-            [f"Телефон: {buyer.get('phone', '')}"] if buyer.get('phone') else [],
-        ]
+        
+        buyer_info = [[buyer_name or "Клиент"]]
+        
+        if buyer.get('inn'):
+            buyer_info.append([f"ИНН: {buyer['inn']}"])
+        if buyer.get('kpp'):
+            buyer_info.append([f"КПП: {buyer['kpp']}"])
+        if buyer.get('legal_address'):
+            buyer_info.append([f"Адрес: {buyer['legal_address']}"])
+            
+        buyer_info.append([f"Email: {buyer.get('email', '')}"])
+        if buyer.get('phone'):
+            buyer_info.append([f"Телефон: {buyer['phone']}"])
+        
         buyer_table = Table(buyer_info, colWidths=[150*mm])
         buyer_table.setStyle(TableStyle([
             ('FONTNAME', (0, 0), (-1, -1), self.font_normal),

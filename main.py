@@ -351,8 +351,10 @@ async def _generate_and_send_invoice(order: OrderCreateIn) -> str:
             "last_name": order.telegram_last_name,
             "email": order.contact_email,
             "phone": order.contact_phone,
-            "company_name": None,
-            "inn": None,
+            "company_name": order.company_name,
+            "inn": order.company_inn,
+            "kpp": order.company_kpp,
+            "legal_address": order.company_legal_address,
         }
         
         # 3. Генерируем PDF

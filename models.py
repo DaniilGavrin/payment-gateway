@@ -86,6 +86,11 @@ class OrderCreateIn(BaseModel):
     telegram_first_name: Optional[str] = Field(None, max_length=128, description="Имя в Telegram")
     telegram_last_name: Optional[str] = Field(None, max_length=128, description="Фамилия в Telegram")
 
+    company_name: Optional[str] = Field(None, max_length=255, description="Название организации")
+    company_inn: Optional[str] = Field(None, max_length=12, description="ИНН организации")
+    company_kpp: Optional[str] = Field(None, max_length=9, description="КПП организации")
+    company_legal_address: Optional[str] = Field(None, max_length=500, description="Юридический адрес")
+
     @field_validator('items')
     @classmethod
     def validate_items_total(cls, v, values):
