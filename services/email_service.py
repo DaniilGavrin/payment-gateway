@@ -20,7 +20,7 @@ class EmailService:
         self,
         to_email: str,
         invoice_number: str,
-        pdf_content: bytes,
+        pdf_bytes: bytes,  # 🔹 ИСПРАВЛЕНО: добавлен параметр
         total_rub: float
     ):
         """Отправляет счёт на email с PDF-вложением"""
@@ -52,9 +52,9 @@ https://bytewizard.ru
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
         
-        # Прикрепляем PDF
+        # 🔹 ИСПРАВЛЕНО: прикрепляем PDF как вложение
         attachment = MIMEBase("application", "octet-stream")
-        attachment.set_payload(pdf_content)
+        attachment.set_payload(pdf_bytes)
         encoders.encode_base64(attachment)
         attachment.add_header(
             "Content-Disposition",
