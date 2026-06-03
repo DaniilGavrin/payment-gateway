@@ -637,11 +637,76 @@ async def get_order_details(
     except Exception as e:
         logger.error(f"Ошибка получения деталей заказа {order_code}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+    
+
+@app.post("/orders/{order_code}/cancel")
+async def cancel_order(
+    order_code: str,
+    payload: dict,
+    _: bool = Depends(require_db_connection)
+):
+    """
+    Отменяет заказ, если он еще в статусе 'pending', и отправляет уведомления.
+    """
+    try:
+        tg_id_int = int(payload.get("tg_id", 0))
+        
+        # 1. Получаем данные заказа для проверки прав и для уведомлений
+        order_row = await db.fetchrow(
+            """
+            SELECT status, total_rub, telegram_id, telegram_first_name
+            FROM orders
+            WHERE order_code = $1 AND tg_id = $2
+            """,
+            order_code, tg_id_int
+        )
+        
+        if not order_row:
+            raise HTTPException(status_code=404, detail="Заказ не найден или доступ запрещен")
+        
+        # 2. Проверяем статус (отменить можно только 'pending')
+        if order_row["status"] != "pending":
+            raise HTTPException(status_code=400, detail="Нельзя отменить заказ с текущим статусом")
+        
+        # 3. Обновляем статус на 'cancelled'
+        await db.execute(
+            """
+            UPDATE orders
+            SET status = 'cancelled', updated_at = NOW()
+            WHERE order_code = $1
+            """,
+            order_code
+        )
+        
+        # 4. Отправляем уведомления об отмене (пользователю и админу)
+        try:
+            await send_telegram_notifications(
+                order_id=order_code,
+                amount_rub=float(order_row["total_rub"]),
+                event="cancelled",
+                telegram_id=str(order_row["telegram_id"]) if order_row["telegram_id"] else None,
+                telegram_first_name=order_row["telegram_first_name"]
+            )
+        except Exception as e:
+            # Не ломаем ответ фронта, если уведомление не ушло, просто логируем
+            logger.error(f"⚠️ Ошибка отправки уведомления об отмене: {e}")
+
+        logger.info(f"✅ Заказ {order_code} успешно отменен пользователем {tg_id_int}")
+        
+        return {"success": True, "message": "Order cancelled successfully"}
+        
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректный tg_id")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Ошибка отмены заказа {order_code}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 async def send_telegram_notifications(
     order_id: str,
     amount_rub: float,
-    event: str,  # "created" или "paid"
+    event: str,  # "created", "paid" или "cancelled"
     payment_url: str | None = None,
     telegram_id: str | None = None,
     telegram_username: str | None = None,
@@ -653,21 +718,22 @@ async def send_telegram_notifications(
 ):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     admin_chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
-    
     if not bot_token:
         logger.warning("⚠️ TELEGRAM_BOT_TOKEN не задан")
         return
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-
-    # ========================================================================
-    # 1. УВЕДОМЛЕНИЕ ПОЛЬЗОВАТЕЛЮ (Только при создании заказа и если есть telegram_id)
-    # ========================================================================
-    if event == "created" and telegram_id and payment_url:
-        user_name = telegram_first_name or "Клиент"
-        user_msg = f"""
-Здравствуйте, {user_name}! 👋
-
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        
+        # ========================================================================
+        # 1. УВЕДОМЛЕНИЕ ПОЛЬЗОВАТЕЛЮ
+        # ========================================================================
+        if telegram_id:
+            user_name = telegram_first_name or "Клиент"
+            
+            if event == "created" and payment_url:
+                user_msg = f"""
+👋 Здравствуйте, {user_name}!
 Мы получили ваш заказ <b>#{order_id}</b>.
 💰 <b>Сумма к оплате:</b> {amount_rub:,.2f} ₽
 
@@ -675,39 +741,54 @@ async def send_telegram_notifications(
 👉 <a href="{payment_url}">Оплатить заказ</a>
 
 Если у вас есть вопросы, наша поддержка всегда на связи!
-        """.strip()
+""".strip()
+            elif event == "paid":
+                user_msg = f"""
+✅ <b>Заказ оплачен!</b>
+Здравствуйте, {user_name}!
+Ваш заказ <b>#{order_id}</b> успешно оплачен.
+Мы уже начали его обработку. Спасибо за покупку!
+""".strip()
+            elif event == "cancelled":
+                user_msg = f"""
+⚠️ <b>Заказ отменен</b>
+Здравствуйте, {user_name}!
+Ваш заказ <b>#{order_id}</b> на сумму {amount_rub:,.2f} ₽ был успешно отменен.
 
-        user_payload = {
-            "chat_id": str(telegram_id),
-            "text": user_msg,
-            "parse_mode": "HTML"
-        }
+Если это была ошибка или у вас есть вопросы, пожалуйста, свяжитесь с нашей поддержкой.
+""".strip()
+            else:
+                user_msg = None
 
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.post(url, json=user_payload)
-                if res.status_code == 200:
-                    logger.info(f"✅ Уведомление отправлено пользователю (TG ID: {telegram_id})")
-                else:
-                    logger.warning(f"⚠️ Не удалось отправить пользователю: {res.text}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки пользователю: {e}")
+            if user_msg:
+                try:
+                    res = await client.post(url, json={
+                        "chat_id": str(telegram_id),
+                        "text": user_msg,
+                        "parse_mode": "HTML"
+                    })
+                    if res.status_code == 200:
+                        logger.info(f"✅ Уведомление пользователю ({event}) отправлено")
+                    else:
+                        logger.warning(f"⚠️ Не удалось отправить пользователю: {res.text}")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка отправки пользователю: {e}")
 
-    # ========================================================================
-    # 2. УВЕДОМЛЕНИЕ АДМИНУ (Всегда)
-    # ========================================================================
-    if not admin_chat_id:
-        logger.warning("⚠️ TELEGRAM_ADMIN_CHAT_ID не задан")
-        return
+        # ========================================================================
+        # 2. УВЕДОМЛЕНИЕ АДМИНУ (Всегда)
+        # ========================================================================
+        if admin_chat_id:
+            if event == "created":
+                admin_title = "🛒 <b>НОВЫЙ ЗАКАЗ</b> (ожидает оплаты)"
+            elif event == "paid":
+                admin_title = "💳 <b>ЗАКАЗ ОПЛАЧЕН</b>"
+            elif event == "cancelled":
+                admin_title = "⚠️ <b>ЗАКАЗ ОТМЕНЕН КЛИЕНТОМ</b>"
+            else:
+                admin_title = "📦 <b>СТАТУС ЗАКАЗА ИЗМЕНЕН</b>"
 
-    if event == "created":
-        admin_title = "🛒 <b>НОВЫЙ ЗАКАЗ</b> (ожидает оплаты)"
-    else:
-        admin_title = "💳 <b>ЗАКАЗ ОПЛАЧЕН</b>"
-
-    admin_msg = f"""
+            admin_msg = f"""
 {admin_title}
-
 🔢 <b>Заказ:</b> {order_id}
 💰 <b>Сумма:</b> {amount_rub:,.2f} ₽
 💳 <b>Оплата:</b> {method or 'не указана'}
@@ -718,28 +799,23 @@ async def send_telegram_notifications(
 • Имя: {telegram_first_name or 'не указано'}
 • Email: {email or 'не указан'}
 • Телефон: {phone or 'не указан'}
-
 📝 <b>Комментарий:</b> {comment or 'нет'}
 
 <a href="https://shop.bytewizard.ru/ru/profile">👉 Проверить в админке</a>
-    """.strip()
-
-    admin_payload = {
-        "chat_id": str(admin_chat_id),
-        "text": admin_msg,
-        "parse_mode": "HTML"
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post(url, json=admin_payload)
-            if res.status_code == 200:
-                logger.info(f"✅ Уведомление админу ({event}) успешно отправлено")
-            else:
-                logger.error(f"❌ Telegram API error (admin): {res.text}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки админу: {e}")
-
+""".strip()
+            
+            try:
+                res = await client.post(url, json={
+                    "chat_id": str(admin_chat_id),
+                    "text": admin_msg,
+                    "parse_mode": "HTML"
+                })
+                if res.status_code == 200:
+                    logger.info(f"✅ Уведомление админу ({event}) успешно отправлено")
+                else:
+                    logger.error(f"❌ Telegram API error (admin): {res.text}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки админу: {e}")
 
 @app.post("/api/telegram/webhook")
 async def telegram_webhook(request: Request, _db: bool = Depends(require_db_connection)):
