@@ -348,14 +348,14 @@ async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
         logger.error(f"Telegram Stars error: {result}")
         raise Exception(f"Telegram API error: {result.get('description')}")
 
-async def _generate_and_send_invoice(order: OrderCreateIn, _db) -> str:
+async def _generate_and_send_invoice(order: OrderCreateIn, db) -> str:
     """
     Генерирует PDF, сохраняет данные в БД, отправляет в Telegram и на email.
     Возвращает URL для скачивания PDF.
     """
     try:
         # 1. Генерируем номер счёта
-        invoice_number = await _db.fetchval(
+        invoice_number = await db.fetchval(
             "SELECT COALESCE(MAX(invoice_number), 'INV-0000') FROM invoices"
         )
         # Увеличиваем номер (INV-0001 -> INV-0002)
@@ -385,7 +385,7 @@ async def _generate_and_send_invoice(order: OrderCreateIn, _db) -> str:
         )
         
         # 4. Сохраняем ДАННЫЕ в БД (не PDF!)
-        await _db.execute(
+        await db.execute(
             """
             INSERT INTO invoices (
                 invoice_number, order_code, buyer_data, seller_data, 
@@ -803,7 +803,7 @@ async def download_invoice(
     """Генерирует PDF на лету и отдаёт клиенту"""
     
     # 1. Получаем данные из БД
-    invoice_data = await _db.fetchrow(
+    invoice_data = await db.fetchrow(
         """
         SELECT buyer_data, seller_data, items_data, total_rub
         FROM invoices
@@ -846,7 +846,7 @@ async def view_invoice(
 ):
     """Открывает PDF в браузере (встроенный просмотр)"""
     
-    invoice_data = await _db.fetchrow(
+    invoice_data = await db.fetchrow(
         """
         SELECT buyer_data, seller_data, items_data, total_rub
         FROM invoices
