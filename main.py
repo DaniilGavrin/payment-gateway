@@ -13,7 +13,6 @@ import http.client
 import generator
 import httpx
 
-
 from urllib.parse import parse_qsl
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -21,16 +20,13 @@ from database.db import db
 from dotenv import load_dotenv
 from dependencies import require_db_connection
 
-
 from models import PaymentRequest, PaymentCancel, PaymentList, CryptoCloudWebhook, OrderCreateIn, OrderCreateOut, OrderItemConfig, OrderItemIn
 from services.webhook_service import is_webhook_processed, process_payment_webhook, mark_webhook_processed
-
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-
 
 from services.email_service import EmailService
 from services.invoice_pdf_service import InvoicePDFService
@@ -76,13 +72,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def verify_cryptocloud_jwt(token: str) -> bool:
     """Проверяет JWT-токен от CryptoCloud (HS256, SECRET_KEY)."""
     secret = os.getenv("CRYPTOCLOUD_SECRET_KEY", "").encode()
     if not secret:
         logger.warning("⚠️ CRYPTOCLOUD_SECRET_KEY not set")
-        return False  # 🔒 В продакшене — строго False!
+        return False
 
     try:
         jwt.decode(token, secret, algorithms=["HS256"], options={"require": ["exp"]})
@@ -141,7 +136,7 @@ async def create_order(
             payload.telegram_username,      
             payload.telegram_first_name,    
             payload.telegram_last_name,
-            payload.client_comment          # <-- Добавили комментарий сюда
+            payload.client_comment
         )
         
         # 🔹 2. Сохраняем позиции заказа (таблица order_items)
@@ -152,7 +147,6 @@ async def create_order(
                     order_id, order_code, product_id, product_name,
                     config, price_rub, delivery_days, created_at
                 ) VALUES (
-                    -- Находим UUID заказа по order_code для связи
                     (SELECT id FROM orders WHERE order_code = $1),
                     $1, $2, $3, $4, $5, $6, NOW()
                 )
@@ -160,7 +154,7 @@ async def create_order(
                 payload.order_id,
                 item.product_id,
                 item.product_name,
-                json.dumps(item.config.dict()),  # 🔥 Конфиг как JSONB
+                json.dumps(item.config.dict()),
                 item.price_rub,
                 item.delivery_days
             )
@@ -169,27 +163,24 @@ async def create_order(
         payment_url = None
         
         if payload.payment_method in ['card', 'sbp']:
-            # 🏦 T-Bank (Tinkoff)
             payment_url = await _create_tbank_payment(payload)
             
         elif payload.payment_method == 'crypto':
-            # ₿ CryptoCloud
             payment_url = await _create_cryptocloud_payment(payload)
 
         elif payload.payment_method == 'stars':
             payment_url = await _create_telegram_stars_payment(payload)
             
         elif payload.payment_method == 'invoice':
-            # 📄 Генерация и отправка счёта
-            invoice_url = await _generate_and_send_invoice(payload, _db)
-            payment_url = invoice_url  # Возвращаем URL на PDF
+            # 🔹 ИСПРАВЛЕНО: Убрали передачу _db, функция использует глобальный db
+            invoice_url = await _generate_and_send_invoice(payload)
+            payment_url = invoice_url
         
         if not payment_url:
             raise HTTPException(status_code=502, detail="Не удалось создать ссылку на оплату")
         
         logger.info(f"✅ Заказ {payload.order_id} создан. Оплата: {payment_url}")
 
-        # 🔹 ДЕБАГ: Явно логируем перед вызовом
         logger.info("📤 Пытаемся отправить уведомление в Telegram...")
         logger.info(f"   Order ID: {payload.order_id}")
         logger.info(f"   Total: {payload.total_rub}")
@@ -229,9 +220,8 @@ async def create_order(
 
 async def _create_tbank_payment(order: OrderCreateIn) -> str:
     """Создает платеж в T-Bank и возвращает ссылку на оплату"""
-    amount_kopecks = int(order.total_rub * 100)  # Т-Банк принимает только копейки (int)
+    amount_kopecks = int(order.total_rub * 100)
 
-    # 1. Параметры для генерации токена (Receipt сюда НЕ добавляем!)
     payment_params = {
         "TerminalKey": os.getenv("TERMINAL_KEY"),
         "Amount": amount_kopecks,
@@ -244,7 +234,6 @@ async def _create_tbank_payment(order: OrderCreateIn) -> str:
 
     token = generator.generate_tinkoff_token(payment_params, os.getenv("SECRET_PASSWORD"))
 
-    # 2. Формируем чек для 54-ФЗ (обязательно для Т-Банка)
     receipt = {
         "Email": order.contact_email or "test@test.com",
         "Phone": order.contact_phone or "",
@@ -260,7 +249,6 @@ async def _create_tbank_payment(order: OrderCreateIn) -> str:
         ]
     }
 
-    # 3. Собираем финальный пейлоад (Receipt добавляем ПОСЛЕ токена)
     full_payload = {
         **payment_params,
         "Token": token,
@@ -298,11 +286,10 @@ async def _create_cryptocloud_payment(order: OrderCreateIn) -> str:
         "Content-Type": "application/json"
     }
     
-    # CryptoCloud принимает сумму в основной валюте (не копейки)
     data = {
         "amount": order.total_rub,
         "shop_id": os.getenv("CRYPTOCLOUD_SHOP_ID"),
-        "currency": "RUB",  # или динамически из payload, если добавишь
+        "currency": "RUB",
         "order_id": order.order_id,
         "success_url": f"https://shop.bytewizard.ru/{order.locale}/profile?order={order.order_id}&status=success",
         "fail_url": f"https://shop.bytewizard.ru/{order.locale}/profile?order={order.order_id}&status=failed",
@@ -312,11 +299,10 @@ async def _create_cryptocloud_payment(order: OrderCreateIn) -> str:
     
     if response.status_code == 200:
         result = response.json()["result"]
-        return result["link"]  # Ссылка на оплату от CryptoCloud
+        return result["link"]
     else:
         logger.error(f"CryptoCloud error: {response.text}")
         raise Exception(f"CryptoCloud API error: {response.text[:200]}")
-    
 
 async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
     """Создает инвойс в Telegram Stars и возвращает прямую ссылку на оплату"""
@@ -324,8 +310,6 @@ async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
     if not bot_token:
         raise Exception("TELEGRAM_BOT_TOKEN не задан в .env")
     
-    # Конвертация рублей в звезды (1 звезда ≈ 1.5-2₽, настрой под свой курс)
-    # Для валюты XTR сумма указывается в ЦЕЛЫХ звездах (без копеек!)
     stars_amount = max(1, int(order.total_rub / 2)) 
     
     url = f"https://api.telegram.org/bot{bot_token}/createInvoiceLink"
@@ -348,7 +332,8 @@ async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
         logger.error(f"Telegram Stars error: {result}")
         raise Exception(f"Telegram API error: {result.get('description')}")
 
-async def _generate_and_send_invoice(order: OrderCreateIn, db) -> str:
+# 🔹 ИСПРАВЛЕНО: Убрали параметр db, используем глобальный объект db
+async def _generate_and_send_invoice(order: OrderCreateIn) -> str:
     """
     Генерирует PDF, сохраняет данные в БД, отправляет в Telegram и на email.
     Возвращает URL для скачивания PDF.
@@ -358,6 +343,7 @@ async def _generate_and_send_invoice(order: OrderCreateIn, db) -> str:
         invoice_number = await db.fetchval(
             "SELECT COALESCE(MAX(invoice_number), 'INV-0000') FROM invoices"
         )
+        
         # Увеличиваем номер (INV-0001 -> INV-0002)
         prefix = "INV-"
         num = int(invoice_number.split("-")[1]) + 1
@@ -369,7 +355,7 @@ async def _generate_and_send_invoice(order: OrderCreateIn, db) -> str:
             "last_name": order.telegram_last_name,
             "email": order.contact_email,
             "phone": order.contact_phone,
-            "company_name": None,  # Позже добавим в форму
+            "company_name": None,
             "inn": None,
         }
         
@@ -425,12 +411,11 @@ async def _generate_and_send_invoice(order: OrderCreateIn, db) -> str:
 
 @app.get("/orders/check")
 async def check_orders():
-    # проверяем с фронта прошел ли платеж, и возвращаем статусы "отменем, или же успех" или как-то ещё чтобы фронт понимал если платеж не прошел то просто ждем так как может быть несколько попыток оплаты мало ли что косячит клиент
     pass
 
 @app.post("/api/crypto-cloud/list-payments")
 async def cryptocloud_list_payments(req: PaymentList, _: str = Depends(verify_admin_token), _db: bool = Depends(require_db_connection)):
-    url = f"{os.getenv("CRYPTOCLOUD_API_URL")}invoice/merchant/list"
+    url = f"{os.getenv('CRYPTOCLOUD_API_URL')}invoice/merchant/list"
 
     headers = {
         "Authorization": f"Token {os.getenv('CRYPTOCLOUD_API_KEY')}",
@@ -468,44 +453,35 @@ async def cryptocloud_list_payments(req: PaymentList, _: str = Depends(verify_ad
             detail=f"CryptoCloud error: {response.text[:200]}"
         )
 
-
 @app.post("/api/crypto-cloud/callback")
-async def cryptocloud_webhook(request: Request, _db: bool = Depends(require_db_connection) ):
+async def cryptocloud_webhook(request: Request, _db: bool = Depends(require_db_connection)):
     """
     Обработчик POSTBACK от CryptoCloud (только JSON).
-    Отвечает быстро, тяжёлую логику выносит в process_payment_webhook.
     """
 
-    # 🔹 1. Быстрая проверка Content-Type
     if not request.headers.get("Content-Type", "").startswith("application/json"):
         logger.warning(f"❌ Wrong Content-Type: {request.headers.get('Content-Type')}")
         raise HTTPException(status_code=415, detail="Only application/json accepted")
 
-    # 🔹 2. Парсим JSON (FastAPI сделает это эффективно)
     try:
         body = await request.json()
     except Exception as e:
         logger.error(f"❌ JSON parse error: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 🔹 3. Валидация через Pydantic (опционально, но даёт чёткие ошибки)
     try:
         webhook = CryptoCloudWebhook(**body)
     except Exception as e:
         logger.warning(f"⚠️ Validation error: {e}")
         raise HTTPException(status_code=422, detail=f"Invalid payload: {str(e)}")
 
-    # 🔹 4. Проверка подписи (самое важное!)
     if not verify_cryptocloud_jwt(webhook.token):
         raise HTTPException(status_code=401, detail="Invalid token signature")
 
-    # 🔹 5. Идемпотентность: не обрабатывай дубли
     if await is_webhook_processed(webhook.invoice_id):
         logger.info(f"⏭️ Duplicate webhook, skipping: {webhook.invoice_id}")
         return JSONResponse(status_code=200, content={"status": "ok", "skipped": True})
 
-    # 🔹 6. Асинхронно обрабатываем бизнес-логику (не блокируя ответ)
-    # Если логика тяжёлая — вынеси в очередь задач (Celery/RQ)
     await process_payment_webhook(
         invoice_id=webhook.invoice_id,
         order_id=webhook.order_id,
@@ -513,10 +489,8 @@ async def cryptocloud_webhook(request: Request, _db: bool = Depends(require_db_c
         invoice_info=webhook.invoice_info
     )
 
-    # 🔹 7. Помечаем как обработанный
     await mark_webhook_processed(webhook.invoice_id)
 
-    # 🔹 8. Отвечаем быстро — CryptoCloud ждёт 200
     return JSONResponse(
         status_code=200,
         content={
@@ -534,7 +508,6 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
     try:
         data = await request.json()
         
-        # 🔹 1. Логируем всё (для отладки)
         logger.info(f"🔔 Webhook от Т-Банка: {json.dumps(data, ensure_ascii=False)}")
         
         payment_id = data.get("PaymentId")
@@ -542,21 +515,18 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         status = data.get("Status")
         amount = data.get("Amount")
         
-        # 🔹 2. Проверка токена (БЕЗОПАСНОСТЬ!)
         if not generator.verify_tbank_webhook_token(data, os.getenv("SECRET_PASSWORD")):
             logger.error(f"❌ НЕВЕРНЫЙ ТОКЕН от Т-Банка! PaymentId={payment_id}")
             return {"Status": "ERROR"}
         
-        # 🔹 3. Идемпотентность (проверяем, не обрабатывали ли уже)
         exists = await db.fetchval(
             "SELECT 1 FROM processed_webhooks WHERE payment_id = $1",
             payment_id
         )
         if exists:
             logger.info(f"⏭️ Webhook уже обработан: PaymentId={payment_id}")
-            return {"Status": "OK"}  # Т-Банк требует OK даже для дублей
+            return {"Status": "OK"}
         
-        # 🔹 4. Обновляем статус заказа
         new_status = "pending"
         
         if status == "CONFIRMED":
@@ -572,13 +542,11 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
             logger.warning(f"↩️ Заказ {order_id} ОТМЕНЁН (возврат)")
             
         elif status == "3DS_CHECKED":
-            # Это промежуточный статус, не меняем основной статус
             logger.info(f"⏳ Заказ {order_id}: 3D-Secure проверен, ждём CONFIRMED")
             await db.execute(
                 "UPDATE orders SET status = '3ds_checked', updated_at = NOW() WHERE order_code = $1",
                 order_id
             )
-            # Помечаем вебхук как обработанный
             await db.execute(
                 "INSERT INTO processed_webhooks (payment_id) VALUES ($1)",
                 payment_id
@@ -588,7 +556,6 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         else:
             logger.warning(f"⚠️ Неизвестный статус {status} для заказа {order_id}")
         
-        # Обновляем статус в БД (если не 3DS_CHECKED)
         if new_status != "pending":
             await db.execute(
                 """
@@ -600,7 +567,6 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
                 order_id
             )
         
-        # 🔹 6. Помечаем вебхук как обработанный
         await db.execute(
             "INSERT INTO processed_webhooks (payment_id) VALUES ($1)",
             payment_id
@@ -608,12 +574,10 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         
         logger.info(f"✅ Webhook обработан: PaymentId={payment_id}, Status={new_status}")
         
-        # Т-Банк требует ответ {"Status": "OK"}
         return {"Status": "OK"}
         
     except Exception as e:
         logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА в webhook: {e}", exc_info=True)
-        # Даже при ошибке возвращаем OK, чтобы Т-Банк не спамил
         return {"Status": "OK"}
 
 @app.get("/orders")
@@ -623,12 +587,10 @@ async def get_user_orders(
 ):
     """
     Возвращает список заказов конкретного пользователя.
-    Используется для страницы профиля.
     """
     try:
         tg_id_int = int(tg_id)
         
-        # Забираем заказы, отсортированные от новых к старым
         rows = await db.fetch(
             """
             SELECT order_code, total_rub, status, payment_method, created_at
@@ -639,7 +601,6 @@ async def get_user_orders(
             tg_id_int
         )
         
-        # Форматируем в удобный для фронта JSON
         orders = [
             {
                 "order_code": row["order_code"],
@@ -666,12 +627,11 @@ async def get_order_details(
     _: bool = Depends(require_db_connection)
 ):
     """
-    Возвращает полную информацию о конкретном заказе (включая items и config).
+    Возвращает полную информацию о конкретном заказе.
     """
     try:
         tg_id_int = int(tg_id)
         
-        # 1. Проверяем, что заказ существует и принадлежит этому пользователю
         order_row = await db.fetchrow(
             """
             SELECT order_code, total_rub, status, payment_method, created_at, 
@@ -685,7 +645,6 @@ async def get_order_details(
         if not order_row:
             raise HTTPException(status_code=404, detail="Заказ не найден или доступ запрещен")
         
-        # 2. Получаем все позиции этого заказа
         items_rows = await db.fetch(
             """
             SELECT product_name, config, price_rub, delivery_days
@@ -695,12 +654,11 @@ async def get_order_details(
             order_code
         )
         
-        # 3. Формируем красивый ответ
         items = []
         for row in items_rows:
             items.append({
                 "product_name": row["product_name"],
-                "config": row["config"],  # Это уже dict (JSONB) благодаря asyncpg
+                "config": row["config"],
                 "price_rub": float(row["price_rub"]),
                 "delivery_days": row["delivery_days"]
             })
@@ -727,7 +685,6 @@ async def get_order_details(
     except Exception as e:
         logger.error(f"Ошибка получения деталей заказа {order_code}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-    
 
 @app.post("/orders/{order_code}/cancel")
 async def cancel_order(
@@ -741,8 +698,6 @@ async def cancel_order(
     try:
         tg_id_int = int(payload.get("tg_id", 0))
         
-        # 1. Получаем данные заказа для проверки прав и для уведомлений
-        # 🔹 ИСПРАВЛЕНО: telegram_id заменено на tg_id
         order_row = await db.fetchrow(
             """
             SELECT status, total_rub, tg_id, telegram_first_name
@@ -755,11 +710,9 @@ async def cancel_order(
         if not order_row:
             raise HTTPException(status_code=404, detail="Заказ не найден или доступ запрещен")
         
-        # 2. Проверяем статус (отменить можно только 'pending')
         if order_row["status"] != "pending":
             raise HTTPException(status_code=400, detail="Нельзя отменить заказ с текущим статусом")
         
-        # 3. Обновляем статус на 'cancelled'
         await db.execute(
             """
             UPDATE orders
@@ -769,18 +722,15 @@ async def cancel_order(
             order_code
         )
         
-        # 4. Отправляем уведомления об отмене (пользователю и админу)
         try:
             await send_telegram_notifications(
                 order_id=order_code,
                 amount_rub=float(order_row["total_rub"]),
                 event="cancelled",
-                # 🔹 ИСПРАВЛЕНО: берем значение из правильной колонки tg_id
                 telegram_id=str(order_row["tg_id"]) if order_row["tg_id"] else None,
                 telegram_first_name=order_row["telegram_first_name"]
             )
         except Exception as e:
-            # Не ломаем ответ фронта, если уведомление не ушло, просто логируем
             logger.error(f"⚠️ Ошибка отправки уведомления об отмене: {e}")
 
         logger.info(f"✅ Заказ {order_code} успешно отменен пользователем {tg_id_int}")
@@ -802,7 +752,6 @@ async def download_invoice(
 ):
     """Генерирует PDF на лету и отдаёт клиенту"""
     
-    # 1. Получаем данные из БД
     invoice_data = await db.fetchrow(
         """
         SELECT buyer_data, seller_data, items_data, total_rub
@@ -815,7 +764,6 @@ async def download_invoice(
     if not invoice_data:
         raise HTTPException(status_code=404, detail="Invoice not found")
     
-    # 2. Генерируем PDF
     pdf_bytes = invoice_pdf_service.generate_invoice_pdf(
         invoice_number=invoice_number,
         order={
@@ -826,7 +774,6 @@ async def download_invoice(
         buyer=invoice_data["buyer_data"]
     )
     
-    # 3. Отдаём как файл
     return StreamingResponse(
         BytesIO(pdf_bytes),
         media_type="application/pdf",
@@ -835,10 +782,6 @@ async def download_invoice(
         }
     )
 
-
-# ========================================================================
-# 🔹 Эндпоинт для просмотра PDF в браузере (inline)
-# ========================================================================
 @app.get("/invoice/{invoice_number}/view")
 async def view_invoice(
     invoice_number: str,
@@ -892,7 +835,6 @@ async def send_invoice_to_telegram(
     
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
     
-    # Текст сообщения
     caption = f"""
 📄 <b>СЧЁТ № {invoice_number}</b>
 💰 <b>Сумма:</b> {total_rub:,.2f} ₽
@@ -901,7 +843,6 @@ async def send_invoice_to_telegram(
 После оплаты мы начнём работу над заказом.
 """.strip()
     
-    # Отправка пользователю
     if telegram_id:
         try:
             files = {
@@ -921,7 +862,6 @@ async def send_invoice_to_telegram(
         except Exception as e:
             logger.error(f"❌ Ошибка отправки пользователю: {e}")
     
-    # Отправка админу
     if admin_chat_id:
         try:
             files = {
@@ -944,7 +884,7 @@ async def send_invoice_to_telegram(
 async def send_telegram_notifications(
     order_id: str,
     amount_rub: float,
-    event: str,  # "created", "paid" или "cancelled"
+    event: str,
     payment_url: str | None = None,
     telegram_id: str | None = None,
     telegram_username: str | None = None,
@@ -963,9 +903,6 @@ async def send_telegram_notifications(
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     async with httpx.AsyncClient(timeout=10.0) as client:
         
-        # ========================================================================
-        # 1. УВЕДОМЛЕНИЕ ПОЛЬЗОВАТЕЛЮ
-        # ========================================================================
         if telegram_id:
             user_name = telegram_first_name or "Клиент"
             
@@ -1012,9 +949,6 @@ async def send_telegram_notifications(
                 except Exception as e:
                     logger.error(f"❌ Ошибка отправки пользователю: {e}")
 
-        # ========================================================================
-        # 2. УВЕДОМЛЕНИЕ АДМИНУ (Всегда)
-        # ========================================================================
         if admin_chat_id:
             if event == "created":
                 admin_title = "🛒 <b>НОВЫЙ ЗАКАЗ</b> (ожидает оплаты)"
@@ -1063,12 +997,10 @@ async def telegram_webhook(request: Request, _db: bool = Depends(require_db_conn
     try:
         data = await request.json()
         
-        # Проверяем, что это успешная оплата
         if "message" in data and "successful_payment" in data["message"]:
             payment = data["message"]["successful_payment"]
             order_id = payment["invoice_payload"]
             
-            # Обновляем статус заказа в БД
             await db.execute(
                 """
                 UPDATE orders 
@@ -1079,8 +1011,6 @@ async def telegram_webhook(request: Request, _db: bool = Depends(require_db_conn
             )
             logger.info(f"✅ Заказ {order_id} успешно оплачен через Telegram Stars!")
             
-            # Отправляем уведомление админу
-            # Сумму берем из БД, чтобы не передавать лишнее
             order_total = await db.fetchval("SELECT total_rub FROM orders WHERE order_code = $1", order_id)
             await send_telegram_notifications(
                 order_id=order_id,
@@ -1088,7 +1018,6 @@ async def telegram_webhook(request: Request, _db: bool = Depends(require_db_conn
                 event="paid",
                 telegram_id=str(data["message"]["chat"]["id"])
             )
-            
 
         return {"ok": True}
     except Exception as e:
