@@ -1,5 +1,3 @@
-import qrcode
-from num2words import num2words
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -22,27 +20,48 @@ class InvoicePDFService:
     def __init__(self):
         self.font_normal = 'Helvetica'
         self.font_bold = 'Helvetica-Bold'
+        self._load_fonts()
+
+    def _load_fonts(self):
+        """Пытается загрузить кириллические шрифты с системных путей"""
         
-        try:
-            base_dir = Path(__file__).parent.parent
-            fonts_dir = base_dir / "fonts"
-            
-            regular_font = fonts_dir / "DejaVuSans.ttf"
-            bold_font = fonts_dir / "DejaVuSans-Bold.ttf"
-            
-            if regular_font.exists() and bold_font.exists():
-                pdfmetrics.registerFont(TTFont('DejaVuSans', str(regular_font)))
-                pdfmetrics.registerFont(TTFont('DejaVuSans-Bold', str(bold_font)))
-                self.font_normal = 'DejaVuSans'
-                self.font_bold = 'DejaVuSans-Bold'
-                logger.info("✅ DejaVu fonts loaded successfully")
-            else:
-                logger.warning(f"⚠️ DejaVu fonts not found in {fonts_dir}")
-        except Exception as e:
-            logger.error(f"❌ Font loading error: {e}")
+        # Пути к шрифтам на Linux (Vercel/AWS Lambda)
+        font_paths = [
+            # DejaVu Sans
+            ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 
+             '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'),
+            ('/usr/share/fonts/dejavu/DejaVuSans.ttf',
+             '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf'),
+            ('/usr/share/fonts/TTF/DejaVuSans.ttf',
+             '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf'),
+            # Liberation Sans (аналог Arial)
+            ('/usr/share/fonts/liberation/LiberationSans-Regular.ttf',
+             '/usr/share/fonts/liberation/LiberationSans-Bold.ttf'),
+            # GNU FreeFont
+            ('/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+             '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf'),
+        ]
+        
+        for reg_path, bold_path in font_paths:
+            if Path(reg_path).exists() and Path(bold_path).exists():
+                try:
+                    pdfmetrics.registerFont(TTFont('CustomSans', reg_path))
+                    pdfmetrics.registerFont(TTFont('CustomSansBold', bold_path))
+                    self.font_normal = 'CustomSans'
+                    self.font_bold = 'CustomSansBold'
+                    logger.info(f"✅ Шрифты загружены: {reg_path}")
+                    return
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось загрузить шрифты из {reg_path}: {e}")
+                    continue
+        
+        # Если ничего не найдено - используем стандартные (кириллица НЕ будет работать)
+        logger.warning("⚠️ Кириллические шрифты не найдены! Используем Helvetica (кириллица может не отображаться)")
 
     def _create_qr_code(self, seller: Dict[str, Any], total: float) -> BytesIO:
         """Создаёт QR-код для быстрой оплаты"""
+        import qrcode
+        
         qr_data = f"""Name:{seller.get('name', '')}
 PersonalAcc:{seller.get('bank_account', '')}
 BankName:{seller.get('bank_name', '')}
@@ -71,6 +90,7 @@ PayeeINN:{seller.get('inn', '')}"""
     def _format_amount_words(self, amount: float) -> str:
         """Форматирует сумму прописью"""
         try:
+            from num2words import num2words
             rubles = int(amount)
             kopecks = int((amount - rubles) * 100)
             rubles_words = num2words(rubles, lang='ru', to='cardinal').capitalize()
@@ -78,12 +98,6 @@ PayeeINN:{seller.get('inn', '')}"""
         except Exception as e:
             logger.error(f"Ошибка форматирования суммы прописью: {e}")
             return f"{amount:.2f} руб."
-
-    def _make_cell(self, text: str, style_name: str = 'Normal', styles=None) -> Paragraph:
-        """Оборачивает строку в Paragraph для таблицы"""
-        if styles is None:
-            styles = getSampleStyleSheet()
-        return Paragraph(text, styles[style_name])
 
     def generate_invoice_pdf(
         self,
