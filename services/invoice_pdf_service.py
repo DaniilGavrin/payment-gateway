@@ -48,20 +48,19 @@ class InvoicePDFService:
         
         logger.error("⚠️ Шрифты Roboto не найдены, используем Helvetica")
 
-    def _create_qr_code(self, seller: Dict[str, Any], total: float) -> BytesIO:
+    def _create_qr_code(self, seller: Dict[str, Any], total: float, invoice_number: str, invoice_date: str) -> BytesIO:
         """Создаёт QR-код для быстрой оплаты по ГОСТ Р 56042-2014"""
         
         # Формат ST00012 (стандарт ЦБ РФ для платежей)
-        # Разделитель — вертикальная черта |
         qr_data = f"ST00012|"
         qr_data += f"Name={seller.get('name', '')}|"
         qr_data += f"PersonalAcc={seller.get('bank_account', '')}|"
         qr_data += f"BankName={seller.get('bank_name', '')}|"
         qr_data += f"BIC={seller.get('bank_bik', '')}|"
         qr_data += f"CorrespAcc={seller.get('bank_corr', '')}|"
-        qr_data += f"Sum={int(total * 100)}|"  # Сумма в копейках!
+        qr_data += f"Sum={int(total * 100)}|"
         qr_data += f"PayeeINN={seller.get('inn', '')}|"
-        qr_data += f"Purpose=Оплата по счёту"
+        qr_data += f"Purpose=Оплата по счёту № {invoice_number} от {invoice_date}"
         
         # Если есть КПП — добавляем
         if seller.get('kpp'):
@@ -71,7 +70,7 @@ class InvoicePDFService:
         
         qr = qrcode.QRCode(
             version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_M,  # M вместо L для надёжности
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
             box_size=10,
             border=2,
         )
@@ -411,7 +410,8 @@ class InvoicePDFService:
             bank_info.append([Paragraph(f"Корр. счёт: {seller['bank_corr']}", styles['CellNormal'])])
         
         try:
-            qr_buffer = self._create_qr_code(seller, total)
+            invoice_date = datetime.now().strftime('%d.%m.%Y')
+            qr_buffer = self._create_qr_code(seller, total, invoice_number, invoice_date)
             qr_img = Image(qr_buffer, width=40*mm, height=40*mm)
             bank_table = Table([[bank_info, qr_img]], colWidths=[130*mm, 50*mm])
             bank_table.setStyle(TableStyle([
