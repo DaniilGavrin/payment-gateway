@@ -1,3 +1,5 @@
+import qrcode
+from num2words import num2words
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -9,6 +11,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
 import logging
 import os
+import urllib.request
 from datetime import datetime
 from typing import Dict, Any
 from pathlib import Path
@@ -17,40 +20,73 @@ logger = logging.getLogger(__name__)
 
 
 class InvoicePDFService:
+    _fonts_downloaded = False  # Флаг, чтобы не скачивать повторно
+    
     def __init__(self):
         self.font_normal = 'Helvetica'
         self.font_bold = 'Helvetica-Bold'
         self._load_fonts()
 
     def _load_fonts(self):
-        """Загружает шрифты Roboto из папки fonts/"""
+        """Загружает шрифты Roboto, скачивая при необходимости"""
         base_dir = Path(__file__).parent.parent
         fonts_dir = base_dir / "fonts"
+        fonts_dir.mkdir(exist_ok=True)
         
         regular_font = fonts_dir / "Roboto-Regular.ttf"
         bold_font = fonts_dir / "Roboto-Bold.ttf"
         
+        # Если шрифты уже есть — используем
         if regular_font.exists() and bold_font.exists():
             try:
                 pdfmetrics.registerFont(TTFont('Roboto', str(regular_font)))
                 pdfmetrics.registerFont(TTFont('RobotoBold', str(bold_font)))
                 self.font_normal = 'Roboto'
                 self.font_bold = 'RobotoBold'
-                logger.info("✅ Шрифты Roboto загружены")
+                logger.info("✅ Шрифты Roboto загружены из кэша")
                 return
             except Exception as e:
-                logger.error(f"❌ Ошибка загрузки шрифтов Roboto: {e}")
-        else:
-            logger.error(f"❌ Шрифты Roboto не найдены в {fonts_dir}")
-            logger.error(f"   Regular exists: {regular_font.exists()}")
-            logger.error(f"   Bold exists: {bold_font.exists()}")
+                logger.error(f"❌ Ошибка загрузки шрифтов: {e}")
         
-        logger.error("⚠️ Используем Helvetica (кириллица НЕ будет работать)")
+        # Если шрифтов нет — скачиваем (только один раз)
+        if not InvoicePDFService._fonts_downloaded:
+            self._download_fonts(regular_font, bold_font)
+            InvoicePDFService._fonts_downloaded = True
+
+    def _download_fonts(self, regular_path: Path, bold_path: Path):
+        """Скачивает шрифты Roboto"""
+        try:
+            logger.info("⬇️ Скачиваем шрифты Roboto...")
+            
+            font_urls = {
+                'Roboto-Regular.ttf': 'https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf',
+                'Roboto-Bold.ttf': 'https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf',
+            }
+            
+            for font_name, url in font_urls.items():
+                font_path = regular_path.parent / font_name
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=30) as response:
+                        with open(font_path, 'wb') as out_file:
+                            out_file.write(response.read())
+                    logger.info(f"✅ Скачан шрифт: {font_name}")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка скачивания {font_name}: {e}")
+                    return
+            
+            # Регистрируем скачанные шрифты
+            pdfmetrics.registerFont(TTFont('Roboto', str(regular_path)))
+            pdfmetrics.registerFont(TTFont('RobotoBold', str(bold_path)))
+            self.font_normal = 'Roboto'
+            self.font_bold = 'RobotoBold'
+            logger.info("✅ Шрифты Roboto скачаны и зарегистрированы")
+            
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка загрузки шрифтов: {e}")
 
     def _create_qr_code(self, seller: Dict[str, Any], total: float) -> BytesIO:
         """Создаёт QR-код для быстрой оплаты"""
-        import qrcode
-        
         qr_data = f"""Name:{seller.get('name', '')}
 PersonalAcc:{seller.get('bank_account', '')}
 BankName:{seller.get('bank_name', '')}
@@ -79,7 +115,6 @@ PayeeINN:{seller.get('inn', '')}"""
     def _format_amount_words(self, amount: float) -> str:
         """Форматирует сумму прописью"""
         try:
-            from num2words import num2words
             rubles = int(amount)
             kopecks = int((amount - rubles) * 100)
             rubles_words = num2words(rubles, lang='ru', to='cardinal').capitalize()
