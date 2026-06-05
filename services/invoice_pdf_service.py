@@ -49,19 +49,29 @@ class InvoicePDFService:
         logger.error("⚠️ Шрифты Roboto не найдены, используем Helvetica")
 
     def _create_qr_code(self, seller: Dict[str, Any], total: float) -> BytesIO:
-        """Создаёт QR-код для быстрой оплаты"""
-        qr_data = f"""Name:{seller.get('name', '')}
-PersonalAcc:{seller.get('bank_account', '')}
-BankName:{seller.get('bank_name', '')}
-BIC:{seller.get('bank_bik', '')}
-CorrespAcc:{seller.get('bank_corr', '')}
-Sum:{int(total * 100)}
-Purpose:Оплата по счёту
-PayeeINN:{seller.get('inn', '')}"""
+        """Создаёт QR-код для быстрой оплаты по ГОСТ Р 56042-2014"""
+        
+        # Формат ST00012 (стандарт ЦБ РФ для платежей)
+        # Разделитель — вертикальная черта |
+        qr_data = f"ST00012|"
+        qr_data += f"Name={seller.get('name', '')}|"
+        qr_data += f"PersonalAcc={seller.get('bank_account', '')}|"
+        qr_data += f"BankName={seller.get('bank_name', '')}|"
+        qr_data += f"BIC={seller.get('bank_bik', '')}|"
+        qr_data += f"CorrespAcc={seller.get('bank_corr', '')}|"
+        qr_data += f"Sum={int(total * 100)}|"  # Сумма в копейках!
+        qr_data += f"PayeeINN={seller.get('inn', '')}|"
+        qr_data += f"Purpose=Оплата по счёту"
+        
+        # Если есть КПП — добавляем
+        if seller.get('kpp'):
+            qr_data = qr_data.replace("Purpose=", f"KPP={seller.get('kpp')}|Purpose=")
+        
+        logger.info(f"🔍 QR данные: {qr_data}")
         
         qr = qrcode.QRCode(
             version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,  # M вместо L для надёжности
             box_size=10,
             border=2,
         )
