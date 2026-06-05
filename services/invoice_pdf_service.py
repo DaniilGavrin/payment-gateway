@@ -1,16 +1,19 @@
+import qrcode
+from qrcode.image.styledpil import StyledPilImage
+from num2words import num2words
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.enums import TA_RIGHT, TA_CENTER
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image, PageBreak
+from reportlab.lib.enums import TA_RIGHT, TA_CENTER, TA_LEFT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from io import BytesIO
 import logging
 import os
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -24,7 +27,6 @@ class InvoicePDFService:
         
         # 🔹 Пытаемся зарегистрировать шрифты DejaVu для кириллицы
         try:
-            # Ищем шрифты в папке fonts/
             base_dir = Path(__file__).parent.parent
             fonts_dir = base_dir / "fonts"
             
@@ -44,6 +46,58 @@ class InvoicePDFService:
             logger.error(f"❌ Font loading error: {e}")
             logger.error("⚠️ Using Helvetica (Cyrillic will NOT work)")
 
+    def _create_qr_code(self, seller: Dict[str, Any], total: float) -> BytesIO:
+        """
+        Создаёт QR-код для быстрой оплаты по банковским реквизитам.
+        Формат: ST00012 (ГОСТ Р 56042-2014) или просто текст с реквизитами
+        """
+        # Формируем строку для QR-кода
+        # Можно использовать формат ST00012 для банковских приложений
+        qr_data = f"""Name:{seller.get('name', '')}
+PersonalAcc:{seller.get('bank_account', '')}
+BankName:{seller.get('bank_name', '')}
+BIC:{seller.get('bank_bik', '')}
+CorrespAcc:{seller.get('bank_corr', '')}
+Sum:{int(total * 100)}
+Purpose:Оплата по счёту
+PayeeINN:{seller.get('inn', '')}"""
+        
+        # Создаём QR-код
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+        
+        # Сохраняем в BytesIO
+        img_buffer = BytesIO()
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        qr_img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        
+        return img_buffer
+
+    def _format_amount_words(self, amount: float) -> str:
+        """Форматирует сумму прописью"""
+        try:
+            # Разделяем на рубли и копейки
+            rubles = int(amount)
+            kopecks = int((amount - rubles) * 100)
+            
+            # Форматируем рубли прописью
+            rubles_words = num2words(rubles, lang='ru', to='cardinal').capitalize()
+            
+            # Форматируем полное сообщение
+            result = f"{rubles_words} рублей {kopecks:02d} копеек"
+            
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка форматирования суммы прописью: {e}")
+            return f"{amount:.2f} руб."
+
     def generate_invoice_pdf(
         self,
         invoice_number: str,
@@ -51,178 +105,255 @@ class InvoicePDFService:
         seller: Dict[str, Any],
         buyer: Dict[str, Any]
     ) -> bytes:
-        """Генерирует PDF счёт и возвращает bytes"""
+        """Генерирует PDF счёт в стиле Reg.ru и возвращает bytes"""
         
         buffer = BytesIO()
         doc = SimpleDocTemplate(
             buffer,
             pagesize=A4,
-            rightMargin=20*mm,
-            leftMargin=20*mm,
-            topMargin=20*mm,
-            bottomMargin=20*mm
+            rightMargin=15*mm,
+            leftMargin=15*mm,
+            topMargin=15*mm,
+            bottomMargin=15*mm
         )
         
         elements = []
         styles = getSampleStyleSheet()
         
-        # 🔹 Кастомные стили с неоновыми цветами
-        styles.add(ParagraphStyle(
-            name='NeoPurple',
-            parent=styles['Normal'],
-            fontName=self.font_bold,
-            fontSize=24,
-            textColor=colors.HexColor('#b026ff'),
-            spaceAfter=20
-        ))
-        
-        styles.add(ParagraphStyle(
-            name='SmallBold',
-            parent=styles['Normal'],
-            fontName=self.font_bold,
-            fontSize=9,
-            textColor=colors.HexColor('#8b5cf6'),
-            spaceAfter=6
-        ))
-        
         # ==================== ШАПКА ====================
-        elements.append(Paragraph("ByteWizard", styles['NeoPurple']))
+        # Левая часть: название компании
+        left_header = []
+        left_header.append(Paragraph(
+            seller.get('name', 'ИП'),
+            ParagraphStyle(
+                'CompanyName',
+                parent=styles['Normal'],
+                fontName=self.font_bold,
+                fontSize=14,
+                textColor=colors.black,
+                spaceAfter=4
+            )
+        ))
         
-        # Инфо о счёте (справа)
-        header_data = [
-            [f"СЧЁТ № {invoice_number}", f"от {datetime.now().strftime('%d.%m.%Y')}"]
-        ]
-        header_table = Table(header_data, colWidths=[100*mm, 60*mm])
+        # ИНН/КПП/ОГРН
+        inn_text = f"ИНН {seller.get('inn', '')}"
+        if seller.get('kpp'):
+            inn_text += f" / КПП {seller.get('kpp')}"
+        left_header.append(Paragraph(
+            inn_text,
+            ParagraphStyle('INN', parent=styles['Normal'], fontSize=9, textColor=colors.black)
+        ))
+        
+        if seller.get('ogrn'):
+            left_header.append(Paragraph(
+                f"ОГРН {seller.get('ogrn')}",
+                ParagraphStyle('OGRN', parent=styles['Normal'], fontSize=9, textColor=colors.black)
+            ))
+        
+        if seller.get('address'):
+            left_header.append(Paragraph(
+                seller.get('address'),
+                ParagraphStyle('Address', parent=styles['Normal'], fontSize=9, textColor=colors.black)
+            ))
+        
+        # Правая часть: СЧЁТ
+        right_header = []
+        right_header.append(Paragraph(
+            f"Счёт № {invoice_number} от {datetime.now().strftime('%d.%m.%Y')}",
+            ParagraphStyle(
+                'InvoiceNumber',
+                parent=styles['Normal'],
+                fontName=self.font_bold,
+                fontSize=14,
+                textColor=colors.black,
+                alignment=TA_RIGHT,
+                spaceAfter=8
+            )
+        ))
+        
+        # Создаём таблицу для шапки
+        header_table = Table(
+            [[left_header, right_header]],
+            colWidths=[100*mm, 80*mm]
+        )
         header_table.setStyle(TableStyle([
-            ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, -1), self.font_bold),
-            ('FONTSIZE', (0, 0), (-1, -1), 14),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#b026ff')),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
         ]))
         elements.append(header_table)
         elements.append(Spacer(1, 15*mm))
         
-        # ==================== ПРОДАВЕЦ ====================
-        elements.append(Paragraph("Продавец:", styles['SmallBold']))
-        seller_info = [
-            [seller.get('name') or "Не указано"],
-        ]
-        if seller.get('inn'):
-            seller_info.append([f"ИНН: {seller['inn']}"])
-        if seller.get('ogrn'):
-            seller_info.append([f"ОГРН: {seller['ogrn']}"])
-        if seller.get('address'):
-            seller_info.append([f"Адрес: {seller['address']}"])
-        if seller.get('email'):
-            seller_info.append([f"Email: {seller['email']}"])
-        if seller.get('phone'):
-            seller_info.append([f"Тел: {seller['phone']}"])
+        # ==================== ИСПОЛНИТЕЛЬ ====================
+        elements.append(Paragraph(
+            "<b>Исполнитель:</b>",
+            ParagraphStyle('SectionTitle', parent=styles['Normal'], fontSize=10, fontName=self.font_bold)
+        ))
         
-        seller_table = Table(seller_info, colWidths=[150*mm])
-        seller_table.setStyle(TableStyle([
+        contractor_info = []
+        contractor_info.append([seller.get('name', 'Не указано')])
+        if seller.get('inn'):
+            contractor_info.append([f"ИНН: {seller['inn']}"])
+        if seller.get('kpp'):
+            contractor_info.append([f"КПП: {seller['kpp']}"])
+        if seller.get('address'):
+            contractor_info.append([f"Адрес: {seller['address']}"])
+        if seller.get('email'):
+            contractor_info.append([f"Email: {seller['email']}"])
+        if seller.get('phone'):
+            contractor_info.append([f"Телефон: {seller['phone']}"])
+        
+        contractor_table = Table(contractor_info, colWidths=[170*mm])
+        contractor_table.setStyle(TableStyle([
             ('FONTNAME', (0, 0), (-1, -1), self.font_normal),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('PADDING', (0, 0), (-1, -1), 3),
+            ('PADDING', (0, 0), (-1, -1), 2),
+            ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.black),
         ]))
-        elements.append(seller_table)
+        elements.append(contractor_table)
         elements.append(Spacer(1, 8*mm))
         
-        # ==================== ПОКУПАТЕЛЬ ====================
-        elements.append(Paragraph("Покупатель:", styles['SmallBold']))
+        # ==================== ЗАКАЗЧИК ====================
+        elements.append(Paragraph(
+            "<b>Заказчик:</b>",
+            ParagraphStyle('SectionTitle2', parent=styles['Normal'], fontSize=10, fontName=self.font_bold)
+        ))
         
-        # 🔹 ИСПРАВЛЕНО: Корректное определение имени покупателя
-        buyer_name = buyer.get('company_name')
-        if not buyer_name:
+        # Определяем имя заказчика
+        customer_name = buyer.get('company_name')
+        if not customer_name:
             first = buyer.get('first_name') or ''
             last = buyer.get('last_name') or ''
-            buyer_name = f"{last} {first}".strip() or "Клиент"
+            customer_name = f"{last} {first}".strip() or "Клиент"
         
-        buyer_info = [[buyer_name]]
-        
+        customer_info = [[customer_name]]
         if buyer.get('inn'):
-            buyer_info.append([f"ИНН: {buyer['inn']}"])
+            customer_info.append([f"ИНН: {buyer['inn']}"])
         if buyer.get('kpp'):
-            buyer_info.append([f"КПП: {buyer['kpp']}"])
+            customer_info.append([f"КПП: {buyer['kpp']}"])
         if buyer.get('legal_address'):
-            buyer_info.append([f"Адрес: {buyer['legal_address']}"])
+            customer_info.append([f"Адрес: {buyer['legal_address']}"])
         if buyer.get('email'):
-            buyer_info.append([f"Email: {buyer['email']}"])
+            customer_info.append([f"Email: {buyer['email']}"])
         if buyer.get('phone'):
-            buyer_info.append([f"Телефон: {buyer['phone']}"])
+            customer_info.append([f"Телефон: {buyer['phone']}"])
         
-        buyer_table = Table(buyer_info, colWidths=[150*mm])
-        buyer_table.setStyle(TableStyle([
+        customer_table = Table(customer_info, colWidths=[170*mm])
+        customer_table.setStyle(TableStyle([
             ('FONTNAME', (0, 0), (-1, -1), self.font_normal),
             ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('LINEBELOW', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('PADDING', (0, 0), (-1, -1), 3),
+            ('PADDING', (0, 0), (-1, -1), 2),
+            ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.black),
         ]))
-        elements.append(buyer_table)
-        elements.append(Spacer(1, 10*mm))
+        elements.append(customer_table)
+        elements.append(Spacer(1, 8*mm))
+        
+        # ==================== ОСНОВАНИЕ ====================
+        contract_number = buyer.get('contract_number', 'Д-1')
+        contract_date = buyer.get('contract_date', datetime.now().strftime('%d.%m.%Y'))
+        contract_url = os.getenv('CONTRACT_URL', 'https://bytewizard.ru/offer')
+        
+        elements.append(Paragraph(
+            f"<b>Основание:</b> Договор № {contract_number} от {contract_date}",
+            ParagraphStyle('Basis', parent=styles['Normal'], fontSize=10, spaceAfter=10)
+        ))
+        elements.append(Spacer(1, 5*mm))
         
         # ==================== ТАБЛИЦА ТОВАРОВ ====================
-        elements.append(Paragraph("Наименование услуг:", styles['SmallBold']))
-        
         # Заголовки таблицы
         table_data = [[
-            "№",
-            "Наименование",
-            "Кол-во",
-            "Цена (₽)",
-            "Сумма (₽)"
+            Paragraph("<b>№</b>", ParagraphStyle('TH', parent=styles['Normal'], fontSize=9, fontName=self.font_bold)),
+            Paragraph("<b>Товары (работы, услуги)</b>", ParagraphStyle('TH', parent=styles['Normal'], fontSize=9, fontName=self.font_bold)),
+            Paragraph("<b>Кол-во</b>", ParagraphStyle('TH', parent=styles['Normal'], fontSize=9, fontName=self.font_bold)),
+            Paragraph("<b>Ед.</b>", ParagraphStyle('TH', parent=styles['Normal'], fontSize=9, fontName=self.font_bold)),
+            Paragraph("<b>Цена</b>", ParagraphStyle('TH', parent=styles['Normal'], fontSize=9, fontName=self.font_bold)),
+            Paragraph("<b>Сумма</b>", ParagraphStyle('TH', parent=styles['Normal'], fontSize=9, fontName=self.font_bold)),
         ]]
         
         # Товары
         for idx, item in enumerate(order['items'], 1):
             table_data.append([
-                str(idx),
-                item['product_name'],
-                "1",
-                f"{item['price_rub']:,.2f}",
-                f"{item['price_rub']:,.2f}"
+                Paragraph(str(idx), ParagraphStyle('TD', parent=styles['Normal'], fontSize=9)),
+                Paragraph(item['product_name'], ParagraphStyle('TD', parent=styles['Normal'], fontSize=9)),
+                Paragraph("1", ParagraphStyle('TD', parent=styles['Normal'], fontSize=9, alignment=TA_CENTER)),
+                Paragraph("шт", ParagraphStyle('TD', parent=styles['Normal'], fontSize=9, alignment=TA_CENTER)),
+                Paragraph(f"{item['price_rub']:,.2f}", ParagraphStyle('TD', parent=styles['Normal'], fontSize=9, alignment=TA_RIGHT)),
+                Paragraph(f"{item['price_rub']:,.2f}", ParagraphStyle('TD', parent=styles['Normal'], fontSize=9, alignment=TA_RIGHT)),
             ])
         
         # Итого
         total = order['total_rub']
+        vat_rate = buyer.get('vat_rate', 20)  # По умолчанию 20%
+        vat_amount = total * vat_rate / 120 if vat_rate > 0 else 0
+        
         table_data.append([
-            "", "", "", "Итого:", f"{total:,.2f}"
+            "", "", "", "",
+            Paragraph("<b>Итого:</b>", ParagraphStyle('Total', parent=styles['Normal'], fontSize=9, fontName=self.font_bold, alignment=TA_RIGHT)),
+            Paragraph(f"<b>{total:,.2f}</b>", ParagraphStyle('Total', parent=styles['Normal'], fontSize=9, fontName=self.font_bold, alignment=TA_RIGHT)),
         ])
         
-        items_table = Table(table_data, colWidths=[15*mm, 80*mm, 20*mm, 35*mm, 35*mm])
+        if vat_rate > 0:
+            table_data.append([
+                "", "", "", "",
+                Paragraph(f"В т.ч. НДС {vat_rate}%:", ParagraphStyle('VAT', parent=styles['Normal'], fontSize=9, alignment=TA_RIGHT)),
+                Paragraph(f"{vat_amount:.2f}", ParagraphStyle('VAT', parent=styles['Normal'], fontSize=9, alignment=TA_RIGHT)),
+            ])
+        
+        table_data.append([
+            "", "", "", "",
+            Paragraph("<b>Всего к оплате:</b>", ParagraphStyle('GrandTotal', parent=styles['Normal'], fontSize=9, fontName=self.font_bold, alignment=TA_RIGHT)),
+            Paragraph(f"<b>{total:,.2f}</b>", ParagraphStyle('GrandTotal', parent=styles['Normal'], fontSize=9, fontName=self.font_bold, alignment=TA_RIGHT)),
+        ])
+        
+        items_table = Table(table_data, colWidths=[15*mm, 85*mm, 20*mm, 20*mm, 25*mm, 25*mm])
         items_table.setStyle(TableStyle([
             # Заголовки
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#b026ff')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f5f5f5')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
             ('FONTNAME', (0, 0), (-1, 0), self.font_bold),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('TOPPADDING', (0, 0), (-1, 0), 8),
             
-            # Данные
-            ('FONTNAME', (0, 1), (-1, -2), self.font_normal),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-            ('GRID', (0, 0), (-1, -2), 0.5, colors.grey),
-            ('LINEABOVE', (-2, 0), (-1, -1), 1, colors.HexColor('#b026ff')),
+            # Границы
+            ('GRID', (0, 0), (-1, -3), 0.5, colors.black),
+            ('LINEBELOW', (0, -3), (-1, -1), 0.5, colors.black),
             
             # Выравнивание
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+            ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+            ('ALIGN', (2, 0), (3, -1), 'CENTER'),
+            ('ALIGN', (4, 0), (-1, -1), 'RIGHT'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             
-            # Итого
-            ('FONTNAME', (-2, -1), (-1, -1), self.font_bold),
-            ('FONTSIZE', (-2, -1), (-1, -1), 11),
-            ('TEXTCOLOR', (-1, -1), (-1, -1), colors.HexColor('#b026ff')),
-            ('BACKGROUND', (-2, -1), (-1, -1), colors.HexColor('#f3e8ff')),
+            # Отступы в ячейках
+            ('PADDING', (0, 1), (-1, -1), 6),
         ]))
         
         elements.append(items_table)
         elements.append(Spacer(1, 10*mm))
         
-        # ==================== БАНКОВСКИЕ РЕКВИЗИТЫ ====================
-        elements.append(Paragraph("Банковские реквизиты:", styles['SmallBold']))
-        bank_info = []
+        # ==================== СУММА ПРОПИСЬЮ ====================
+        items_count = len(order['items'])
+        amount_words = self._format_amount_words(total)
         
+        total_text = f"""
+<b>Всего наименований {items_count}, на сумму {total:,.2f} рублей</b><br/>
+<b>{amount_words.capitalize()}</b>
+""".strip()
+        
+        elements.append(Paragraph(
+            total_text,
+            ParagraphStyle('TotalWords', parent=styles['Normal'], fontSize=10, spaceAfter=10)
+        ))
+        elements.append(Spacer(1, 10*mm))
+        
+        # ==================== БАНКОВСКИЕ РЕКВИЗИТЫ С QR-КОДОМ ====================
+        elements.append(Paragraph(
+            "<b>Банковские реквизиты:</b>",
+            ParagraphStyle('BankTitle', parent=styles['Normal'], fontSize=10, fontName=self.font_bold, spaceAfter=8)
+        ))
+        
+        # Левая часть: реквизиты
+        bank_info = []
         if seller.get('bank_name'):
             bank_info.append([f"Банк: {seller['bank_name']}"])
         if seller.get('bank_account'):
@@ -232,9 +363,23 @@ class InvoicePDFService:
         if seller.get('bank_corr'):
             bank_info.append([f"Корр. счёт: {seller['bank_corr']}"])
         
-        # 🔹 Если реквизиты есть — рисуем таблицу
-        if bank_info:
-            bank_table = Table(bank_info, colWidths=[150*mm])
+        # Правая часть: QR-код
+        try:
+            qr_buffer = self._create_qr_code(seller, total)
+            qr_img = Image(qr_buffer, width=40*mm, height=40*mm)
+            bank_table = Table(
+                [[bank_info, qr_img]],
+                colWidths=[130*mm, 50*mm]
+            )
+            bank_table.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+            ]))
+            elements.append(bank_table)
+        except Exception as e:
+            logger.error(f"Ошибка создания QR-кода: {e}")
+            # Если QR не получился, просто выводим реквизиты
+            bank_table = Table(bank_info, colWidths=[170*mm])
             bank_table.setStyle(TableStyle([
                 ('FONTNAME', (0, 0), (-1, -1), self.font_normal),
                 ('FONTSIZE', (0, 0), (-1, -1), 9),
@@ -244,37 +389,27 @@ class InvoicePDFService:
             ]))
             elements.append(bank_table)
         
-        # ==================== ПОДВАЛ ====================
-        elements.append(Spacer(1, 20*mm))
+        elements.append(Spacer(1, 15*mm))
         
-        footer_style = ParagraphStyle(
-            'FooterStyle',
-            parent=styles['Normal'],
-            fontName=self.font_normal,
-            fontSize=9
-        )
-        
-        director_name = seller.get('director') or "____________"
-        accountant_name = seller.get('accountant') or "____________"
+        # ==================== FOOTER С ОФЕРТОЙ ====================
+        offer_url = os.getenv('OFFER_URL', 'https://bytewizard.ru/offer')
         
         footer_text = f"""
-        <b>Руководитель</b> ____________________ / {director_name} /<br/><br/>
-        <b>Главный бухгалтер</b> ____________________ / {accountant_name} /
-        """
-        elements.append(Paragraph(footer_text, footer_style))
+Оплата данного счёта означает согласие Заказчика с условиями Договора об оказании услуг (далее - Договор),
+являющегося публичной офертой и размещенного по адресу {offer_url}. В дальнейшем Заказчик осуществляет 
+оплату услуг по Договору в соответствии с условиями Договора.
+        """.strip()
         
-        elements.append(Spacer(1, 10*mm))
-        
-        footer_note = ParagraphStyle(
-            'FooterNote',
-            parent=styles['Normal'],
-            fontName=self.font_normal,
-            fontSize=8,
-            textColor=colors.grey
-        )
         elements.append(Paragraph(
-            "<i>Счёт действителен в течение 3 банковских дней.</i>",
-            footer_note
+            footer_text,
+            ParagraphStyle(
+                'OfferFooter',
+                parent=styles['Normal'],
+                fontSize=8,
+                textColor=colors.grey,
+                alignment=TA_LEFT,
+                leading=10
+            )
         ))
         
         # ==================== ГЕНЕРАЦИЯ ====================
