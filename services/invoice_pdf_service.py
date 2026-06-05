@@ -51,6 +51,16 @@ class InvoicePDFService:
     def _create_qr_code(self, seller: Dict[str, Any], total: float, invoice_number: str, invoice_date: str) -> BytesIO:
         """Создаёт QR-код для быстрой оплаты по ГОСТ Р 56042-2014"""
         
+        # Проверяем ставку НДС
+        vat_rate = int(os.getenv('COMPANY_VAT_RATE', 0))
+        
+        # Формируем назначение платежа
+        purpose = f"Оплата по счёту № {invoice_number} от {invoice_date}"
+        if vat_rate == 0:
+            purpose += ". НДС не облагается"
+        else:
+            purpose += f". В т.ч. НДС {vat_rate}%"
+        
         # Формат ST00012 (стандарт ЦБ РФ для платежей)
         qr_data = f"ST00012|"
         qr_data += f"Name={seller.get('name', '')}|"
@@ -60,13 +70,13 @@ class InvoicePDFService:
         qr_data += f"CorrespAcc={seller.get('bank_corr', '')}|"
         qr_data += f"Sum={int(total * 100)}|"
         qr_data += f"PayeeINN={seller.get('inn', '')}|"
-        qr_data += f"Purpose=Оплата по счёту № {invoice_number} от {invoice_date}"
+        qr_data += f"Purpose={purpose}"
         
         # Если есть КПП — добавляем
         if seller.get('kpp'):
             qr_data = qr_data.replace("Purpose=", f"KPP={seller.get('kpp')}|Purpose=")
         
-        logger.info(f"🔍 QR данные: {qr_data}")
+        logger.info(f" QR данные: {qr_data}")
         
         qr = qrcode.QRCode(
             version=1,
@@ -306,46 +316,44 @@ class InvoicePDFService:
             ])
         
         total = order['total_rub']
-        vat_rate = buyer.get('vat_rate', 20)
-        vat_amount = total * vat_rate / 120 if vat_rate > 0 else 0
-        
-        table_data.append([
-            "", "", "", "",
-            Paragraph(
-                "<b>Итого:</b>",
-                ParagraphStyle('Total', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)
-            ),
-            Paragraph(
-                f"<b>{total:,.2f}</b>",
-                ParagraphStyle('Total2', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)
-            ),
-        ])
-        
+        vat_rate = int(os.getenv('COMPANY_VAT_RATE', 0))  # ← Читаем из .env
+
+        # Если НДС есть - считаем и показываем
         if vat_rate > 0:
+            vat_amount = total * vat_rate / 120
             table_data.append([
                 "", "", "", "",
-                Paragraph(
-                    f"В т.ч. НДС {vat_rate}%:",
-                    ParagraphStyle('VAT', parent=styles['CellNormal'], fontName=self.font_normal, alignment=TA_RIGHT)
-                ),
-                Paragraph(
-                    f"{vat_amount:.2f}",
-                    ParagraphStyle('VAT2', parent=styles['CellNormal'], fontName=self.font_normal, alignment=TA_RIGHT)
-                ),
+                Paragraph("<b>Итого:</b>", ParagraphStyle('Total', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
+                Paragraph(f"<b>{total:,.2f}</b>", ParagraphStyle('Total2', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
             ])
-        
-        table_data.append([
-            "", "", "", "",
-            Paragraph(
-                "<b>Всего к оплате:</b>",
-                ParagraphStyle('GrandTotal', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)
-            ),
-            Paragraph(
-                f"<b>{total:,.2f}</b>",
-                ParagraphStyle('GrandTotal2', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)
-            ),
-        ])
-        
+            table_data.append([
+                "", "", "", "",
+                Paragraph(f"В т.ч. НДС {vat_rate}%:", ParagraphStyle('VAT', parent=styles['CellNormal'], fontName=self.font_normal, alignment=TA_RIGHT)),
+                Paragraph(f"{vat_amount:.2f}", ParagraphStyle('VAT2', parent=styles['CellNormal'], fontName=self.font_normal, alignment=TA_RIGHT)),
+            ])
+            table_data.append([
+                "", "", "", "",
+                Paragraph("<b>Всего к оплате:</b>", ParagraphStyle('GrandTotal', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
+                Paragraph(f"<b>{total:,.2f}</b>", ParagraphStyle('GrandTotal2', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
+            ])
+        else:
+            # Если НДС нет (УСН) - показываем без НДС
+            table_data.append([
+                "", "", "", "",
+                Paragraph("<b>Итого:</b>", ParagraphStyle('Total', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
+                Paragraph(f"<b>{total:,.2f}</b>", ParagraphStyle('Total2', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
+            ])
+            table_data.append([
+                "", "", "", "",
+                Paragraph("НДС не облагается (УСН)", ParagraphStyle('NoVAT', parent=styles['CellNormal'], fontName=self.font_normal, alignment=TA_RIGHT)),
+                Paragraph("", ParagraphStyle('NoVAT2', parent=styles['CellNormal'], fontName=self.font_normal, alignment=TA_RIGHT)),
+            ])
+            table_data.append([
+                "", "", "", "",
+                Paragraph("<b>Всего к оплате:</b>", ParagraphStyle('GrandTotal', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
+                Paragraph(f"<b>{total:,.2f}</b>", ParagraphStyle('GrandTotal2', parent=styles['CellBold'], fontName=self.font_bold, alignment=TA_RIGHT)),
+            ])
+
         items_table = Table(table_data, colWidths=[15*mm, 85*mm, 20*mm, 20*mm, 25*mm, 25*mm])
         items_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f5f5f5')),
