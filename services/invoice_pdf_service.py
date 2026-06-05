@@ -23,40 +23,29 @@ class InvoicePDFService:
         self._load_fonts()
 
     def _load_fonts(self):
-        """Пытается загрузить кириллические шрифты с системных путей"""
+        """Загружает шрифты Roboto из папки fonts/"""
+        base_dir = Path(__file__).parent.parent
+        fonts_dir = base_dir / "fonts"
         
-        # Пути к шрифтам на Linux (Vercel/AWS Lambda)
-        font_paths = [
-            # DejaVu Sans
-            ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 
-             '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'),
-            ('/usr/share/fonts/dejavu/DejaVuSans.ttf',
-             '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf'),
-            ('/usr/share/fonts/TTF/DejaVuSans.ttf',
-             '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf'),
-            # Liberation Sans (аналог Arial)
-            ('/usr/share/fonts/liberation/LiberationSans-Regular.ttf',
-             '/usr/share/fonts/liberation/LiberationSans-Bold.ttf'),
-            # GNU FreeFont
-            ('/usr/share/fonts/truetype/freefont/FreeSans.ttf',
-             '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf'),
-        ]
+        regular_font = fonts_dir / "Roboto-Regular.ttf"
+        bold_font = fonts_dir / "Roboto-Bold.ttf"
         
-        for reg_path, bold_path in font_paths:
-            if Path(reg_path).exists() and Path(bold_path).exists():
-                try:
-                    pdfmetrics.registerFont(TTFont('CustomSans', reg_path))
-                    pdfmetrics.registerFont(TTFont('CustomSansBold', bold_path))
-                    self.font_normal = 'CustomSans'
-                    self.font_bold = 'CustomSansBold'
-                    logger.info(f"✅ Шрифты загружены: {reg_path}")
-                    return
-                except Exception as e:
-                    logger.warning(f"⚠️ Не удалось загрузить шрифты из {reg_path}: {e}")
-                    continue
+        if regular_font.exists() and bold_font.exists():
+            try:
+                pdfmetrics.registerFont(TTFont('Roboto', str(regular_font)))
+                pdfmetrics.registerFont(TTFont('RobotoBold', str(bold_font)))
+                self.font_normal = 'Roboto'
+                self.font_bold = 'RobotoBold'
+                logger.info("✅ Шрифты Roboto загружены")
+                return
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки шрифтов Roboto: {e}")
+        else:
+            logger.error(f"❌ Шрифты Roboto не найдены в {fonts_dir}")
+            logger.error(f"   Regular exists: {regular_font.exists()}")
+            logger.error(f"   Bold exists: {bold_font.exists()}")
         
-        # Если ничего не найдено - используем стандартные (кириллица НЕ будет работать)
-        logger.warning("⚠️ Кириллические шрифты не найдены! Используем Helvetica (кириллица может не отображаться)")
+        logger.error("⚠️ Используем Helvetica (кириллица НЕ будет работать)")
 
     def _create_qr_code(self, seller: Dict[str, Any], total: float) -> BytesIO:
         """Создаёт QR-код для быстрой оплаты"""
