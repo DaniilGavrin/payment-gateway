@@ -13,6 +13,7 @@ import http.client
 import generator
 import httpx
 
+from typing import Any
 from urllib.parse import parse_qsl
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -99,6 +100,114 @@ def verify_admin_token(token: str = Header(..., alias="X-Admin-Token")):
         raise HTTPException(status_code=401, detail="Invalid or missing admin token")
     return token
 
+def calculate_server_price(
+    base_price: float,
+    selections: dict[str, Any],
+    config_schema: dict[str, Any]
+) -> float:
+    """
+    Серверная версия calculateDynamicPrice из фронтенда.
+    Должна быть ИДЕНТИЧНА клиентской логике.
+    """
+    total = float(base_price)
+    
+    for field_id, field in config_schema.items():
+        val = selections.get(field_id)
+        if val is None:
+            continue
+        
+        field_type = field.get("type")
+        
+        if field_type == "checkbox" and val is True:
+            total += float(field.get("price_modifier", 0))
+            
+        elif field_type == "select" and isinstance(val, str):
+            options = field.get("options", [])
+            opt = next((o for o in options if o["value"] == val), None)
+            if opt:
+                total += float(opt.get("price_modifier", 0))
+                
+        elif field_type == "number" and isinstance(val, (int, float)):
+            price_per_unit = float(field.get("price_per_unit", 0))
+            if price_per_unit > 0:
+                base_count = float(field.get("default", field.get("min", 0)))
+                extra = max(0, val - base_count)
+                total += extra * price_per_unit
+                
+        elif field_type == "multiselect" and isinstance(val, list):
+            options = field.get("options", [])
+            for v in val:
+                opt = next((o for o in options if o["value"] == v), None)
+                if opt:
+                    total += float(opt.get("price_modifier", 0))
+    
+    return round(total, 2)
+
+
+def calculate_server_delivery_days(
+    base_days: int,
+    selections: dict[str, Any],
+    config_schema: dict[str, Any],
+    delivery_meta: dict[str, Any]
+) -> int:
+    """
+    Серверная версия calculateDynamicDelivery из фронтенда.
+    """
+    option_days = 0
+    
+    for field_id, field in config_schema.items():
+        if field_id == "urgency":
+            continue
+            
+        val = selections.get(field_id)
+        if val is None:
+            continue
+        
+        def get_days(mod=None, price=None):
+            if mod is not None:
+                return mod
+            return max(0, int((price or 0) / 8000))
+        
+        field_type = field.get("type")
+        
+        if field_type == "checkbox" and val is True:
+            option_days += get_days(
+                field.get("delivery_days_modifier"),
+                field.get("price_modifier")
+            )
+        elif field_type == "select" and isinstance(val, str):
+            options = field.get("options", [])
+            opt = next((o for o in options if o["value"] == val), None)
+            if opt:
+                option_days += get_days(
+                    opt.get("delivery_days_modifier"),
+                    opt.get("price_modifier")
+                )
+        elif field_type == "multiselect" and isinstance(val, list):
+            options = field.get("options", [])
+            for v in val:
+                opt = next((o for o in options if o["value"] == v), None)
+                if opt:
+                    option_days += get_days(
+                        opt.get("delivery_days_modifier"),
+                        opt.get("price_modifier")
+                    )
+    
+    total_days = base_days + option_days
+    
+    # Применяем множитель срочности
+    urgency = selections.get("urgency")
+    URGENCY_MULTIPLIERS = {
+        "normal": 1.0,
+        "fast": 0.85,
+        "ultra_fast": 0.70,
+    }
+    multiplier = URGENCY_MULTIPLIERS.get(urgency or "normal", 1.0)
+    total_days = int(total_days * multiplier)
+    
+    min_days = delivery_meta.get("min_days") or int(base_days * 0.4)
+    return max(min_days, int(total_days) + (1 if total_days % 1 > 0 else 0))
+
 @app.get("/")
 async def root():
     return {
@@ -109,39 +218,111 @@ async def root():
 @app.post("/orders/create", response_model=OrderCreateOut)
 async def create_order(
     payload: OrderCreateIn,
-    current_user: dict = Depends(get_current_user),  # ← ДОБАВЬ
+    current_user: dict = Depends(get_current_user),
     _db: bool = Depends(require_db_connection)
 ):
-    tg_id_from_jwt = current_user["tg_id"]
-    username_from_jwt = current_user.get("username")
-    
-    logger.info(f"📦 Новый заказ: {payload.order_id} | {payload.payment_method} | {payload.total_rub}₽ | User: {tg_id_from_jwt}")
+    logger.info(f"📦 Новый заказ: {payload.order_id} | User: {current_user['tg_id']}")
     
     try:
+        # 🔥 ШАГ 0: ВАЛИДАЦИЯ ЦЕНЫ И СРОКОВ НА СЕРВЕРЕ
+        server_calculated_total = 0.0
+        is_price_suspicious = False
+        client_submitted_total = payload.total_rub
+        
+        for item in payload.items:
+            # 1. Получаем реальные данные товара из БД
+            product = await db.fetchrow(
+                "SELECT base_price_rub, metadata, is_active FROM products WHERE id = $1", 
+                item.product_id
+            )
+            
+            if not product or not product["is_active"]:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Товар с ID {item.product_id} не найден или неактивен"
+                )
+            
+            # 2. Парсим metadata (если это строка)
+            metadata = product["metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            
+            config_schema = metadata.get("config_schema", {})
+            delivery_meta = metadata.get("delivery", {})
+            
+            # 3. Пересчитываем цену на сервере
+            calculated_price = calculate_server_price(
+                product["base_price_rub"],
+                item.config.dict(),
+                config_schema
+            )
+            
+            # 4. Пересчитываем сроки доставки
+            calculated_delivery = calculate_server_delivery_days(
+                delivery_meta.get("base_days", 1),
+                item.config.dict(),
+                config_schema,
+                delivery_meta
+            )
+            
+            # 5. Сравниваем с присланными значениями
+            price_diff = abs(calculated_price - item.price_rub)
+            delivery_diff = abs(calculated_delivery - item.delivery_days)
+            
+            if price_diff > 1.0 or delivery_diff > 1:
+                is_price_suspicious = True
+                logger.warning(
+                    f"🚨 ПОДОЗРИТЕЛЬНЫЙ ТОВАР! Product: {item.product_id} | "
+                    f"Клиент указал: {item.price_rub}₽ / {item.delivery_days} дн. | "
+                    f"Сервер насчитал: {calculated_price}₽ / {calculated_delivery} дн."
+                )
+            
+            server_calculated_total += calculated_price
+        
+        # 6. Финальная проверка общей суммы
+        total_diff = abs(server_calculated_total - client_submitted_total)
+        if total_diff > 1.0:
+            is_price_suspicious = True
+            logger.warning(
+                f"🚨 ПОДМЕНА ИТОГОВОЙ СУММЫ! Order: {payload.order_id} | "
+                f"Клиент: {client_submitted_total}₽ | Сервер: {server_calculated_total}₽ | "
+                f"Разница: {total_diff}₽"
+            )
+        
+        if not is_price_suspicious:
+            logger.info(f"✅ Валидация пройдена. Итого: {server_calculated_total}₽")
+        
+        # 🔹 ШАГ 1: Сохраняем заказ в БД (с реальной ценой)
+        tg_id_val = current_user["tg_id"]
+        username_val = current_user.get("username")
+        first_name_val = payload.telegram_first_name or "Клиент"
+
         await db.execute(
             """
             INSERT INTO orders (
                 order_code, client_email, client_phone, payment_method, 
                 total_rub, status, 
                 tg_id, telegram_username, telegram_first_name, telegram_last_name,
-                client_comment, 
+                client_comment, is_price_suspicious, client_submitted_total,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
             """,
             payload.order_id,
             payload.contact_email,
             payload.contact_phone,
             payload.payment_method,
-            payload.total_rub,
+            server_calculated_total,  # 🔥 Реальная цена
             'pending',
-            tg_id_from_jwt,
-            username_from_jwt,
-            payload.telegram_first_name,
+            tg_id_val,                      
+            username_val,      
+            first_name_val,    
             payload.telegram_last_name,
-            payload.client_comment
+            payload.client_comment,
+            is_price_suspicious,  # 🔥 Флаг подозрительности
+            client_submitted_total  # 🔥 Цена, которую прислал клиент
         )
         
-        # 🔹 2. Сохраняем позиции заказа (таблица order_items)
+        # 🔹 ШАГ 2: Сохраняем позиции заказа
         for item in payload.items:
             await db.execute(
                 """
@@ -820,7 +1001,9 @@ async def send_telegram_notifications(
     email: str = "",
     phone: str = "",
     method: str = "",
-    comment: str = ""
+    comment: str = "",
+    is_price_suspicious: bool = False,
+    client_submitted_total: float | None = None
 ):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     admin_chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
@@ -878,7 +1061,10 @@ async def send_telegram_notifications(
                     logger.error(f"❌ Ошибка отправки пользователю: {e}")
 
         if admin_chat_id:
-            if event == "created":
+            if is_price_suspicious:
+                admin_title = "🚨 <b>ПОДОЗРИТЕЛЬНЫЙ ЗАКАЗ</b> 🚨"
+                price_warning = f"\n⚠️ <b>Сумма от клиента:</b> {client_submitted_total:,.2f} ₽ (ПОДМЕНА?)"
+            elif event == "created":
                 admin_title = "🛒 <b>НОВЫЙ ЗАКАЗ</b> (ожидает оплаты)"
             elif event == "paid":
                 admin_title = "💳 <b>ЗАКАЗ ОПЛАЧЕН</b>"
