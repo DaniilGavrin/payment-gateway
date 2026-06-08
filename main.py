@@ -372,8 +372,10 @@ async def create_order(
             logger.info("📤 Начинаем отправку уведомлений в Telegram...")
             await send_telegram_notifications(
                 order_id=payload.order_id,
-                amount_rub=payload.total_rub,
+                amount_rub=server_calculated_total,
                 event="created",
+                is_price_suspicious=is_price_suspicious,
+                client_submitted_total=client_submitted_total,
                 payment_url=payment_url,
                 telegram_id=payload.telegram_id,
                 telegram_username=payload.telegram_username,
