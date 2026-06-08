@@ -81,7 +81,8 @@ class OrderCreateIn(BaseModel):
     payment_method: str = Field(..., pattern="^(card|sbp|crypto|invoice|stars)$")
     locale: str = Field(default="ru", pattern="^(ru|en)$")
 
-    telegram_id: Optional[str] = Field(None, max_length=64, description="ID пользователя Telegram")
+    # ✅ telegram_id теперь опциональный (берём из JWT, но фронт может передать для обратной совместимости)
+    telegram_id: Optional[str] = Field(None, max_length=64, description="ID пользователя Telegram (опционально, берётся из JWT)")
     telegram_username: Optional[str] = Field(None, max_length=64, description="Username в Telegram")
     telegram_first_name: Optional[str] = Field(None, max_length=128, description="Имя в Telegram")
     telegram_last_name: Optional[str] = Field(None, max_length=128, description="Фамилия в Telegram")
@@ -94,10 +95,9 @@ class OrderCreateIn(BaseModel):
     @field_validator('items')
     @classmethod
     def validate_items_total(cls, v, values):
-        # Опциональная проверка: сумма позиций ≈ total (с допуском на копеечные расхождения)
         if 'total_rub' in values.data:
             calc_total = sum(item.price_rub for item in v)
-            if abs(calc_total - values.data['total_rub']) > 1:  # допуск 1 рубль
+            if abs(calc_total - values.data['total_rub']) > 1:
                 raise ValueError(f"Сумма позиций ({calc_total}) не совпадает с total_rub")
         return v
 

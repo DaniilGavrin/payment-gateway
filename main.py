@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, FileResponse, Response
 
 from services.email_service import EmailService
 from services.invoice_pdf_service import InvoicePDFService
+from auth.dependencies import get_current_user
 
 email_service = EmailService()
 invoice_pdf_service = InvoicePDFService()
@@ -108,14 +109,15 @@ async def root():
 @app.post("/orders/create", response_model=OrderCreateOut)
 async def create_order(
     payload: OrderCreateIn,
+    current_user: dict = Depends(get_current_user),  # ← ДОБАВЬ
     _db: bool = Depends(require_db_connection)
 ):
-    logger.info(f"📦 Новый заказ: {payload.order_id} | {payload.payment_method} | {payload.total_rub}₽")
+    tg_id_from_jwt = current_user["tg_id"]
+    username_from_jwt = current_user.get("username")
+    
+    logger.info(f"📦 Новый заказ: {payload.order_id} | {payload.payment_method} | {payload.total_rub}₽ | User: {tg_id_from_jwt}")
     
     try:
-        # 🔹 1. Сохраняем заказ в БД (таблица orders)
-        tg_id_val = int(payload.telegram_id) if payload.telegram_id else None
-
         await db.execute(
             """
             INSERT INTO orders (
@@ -132,9 +134,9 @@ async def create_order(
             payload.payment_method,
             payload.total_rub,
             'pending',
-            tg_id_val,                      
-            payload.telegram_username,      
-            payload.telegram_first_name,    
+            tg_id_from_jwt,
+            username_from_jwt,
+            payload.telegram_first_name,
             payload.telegram_last_name,
             payload.client_comment
         )
@@ -582,14 +584,14 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
 
 @app.get("/orders")
 async def get_user_orders(
-    tg_id: str = Query(..., description="Telegram ID пользователя"),
+    current_user: dict = Depends(get_current_user),
     _: bool = Depends(require_db_connection)
 ):
     """
     Возвращает список заказов конкретного пользователя.
     """
     try:
-        tg_id_int = int(tg_id)
+        tg_id_int = current_user["tg_id"]
         
         rows = await db.fetch(
             """
@@ -617,20 +619,20 @@ async def get_user_orders(
     except ValueError:
         raise HTTPException(status_code=400, detail="Некорректный tg_id")
     except Exception as e:
-        logger.error(f"Ошибка получения заказов для tg_id {tg_id}: {e}")
+        logger.error(f"Ошибка получения заказов для tg_id {tg_id_int}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/orders/{order_code}")
 async def get_order_details(
     order_code: str,
-    tg_id: str = Query(..., description="Telegram ID пользователя для проверки прав"),
+    current_user: dict = Depends(get_current_user),
     _: bool = Depends(require_db_connection)
 ):
     """
     Возвращает полную информацию о конкретном заказе.
     """
     try:
-        tg_id_int = int(tg_id)
+        tg_id_int = current_user["tg_id"]
         
         order_row = await db.fetchrow(
             """
@@ -689,14 +691,14 @@ async def get_order_details(
 @app.post("/orders/{order_code}/cancel")
 async def cancel_order(
     order_code: str,
-    payload: dict,
+    current_user: dict = Depends(get_current_user),
     _: bool = Depends(require_db_connection)
 ):
     """
     Отменяет заказ, если он еще в статусе 'pending', и отправляет уведомления.
     """
     try:
-        tg_id_int = int(payload.get("tg_id", 0))
+        tg_id_int = current_user["tg_id"]
         
         order_row = await db.fetchrow(
             """
