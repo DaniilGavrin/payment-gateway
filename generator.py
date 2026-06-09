@@ -1,6 +1,7 @@
 import hashlib
 
 def generate_tinkoff_token(payload: dict, password: str) -> str:
+    """Генерация токена для запроса к Т-Банку."""
     flat_params = {
         key: str(value) if value is not None else ""
         for key, value in payload.items()
@@ -11,30 +12,36 @@ def generate_tinkoff_token(payload: dict, password: str) -> str:
     concatenated = "".join(value for _, value in sorted_params)
     return hashlib.sha256(concatenated.encode("utf-8")).hexdigest()
 
-
 def verify_tbank_webhook_token(data: dict, secret_password: str) -> bool:
     """
     Проверяет токен от Т-Банка.
-    Т-Банк присылает Token, который нужно пересчитать и сравнить.
+    
+    Алгоритм по документации:
+    1. Берём все поля webhook КРОМЕ Token
+    2. Добавляем Password = secret_password
+    3. Сортируем ВСЕ ключи по алфавиту (включая Password!)
+    4. Конкатенируем значения (None → "")
+    5. SHA256 → сравниваем с Token
     """
     received_token = data.get("Token")
     if not received_token:
         return False
     
-    # Убираем Token из данных для проверки
+    # 1. Копируем данные БЕЗ Token
     data_copy = {k: v for k, v in data.items() if k != "Token"}
     
-    # Сортируем ключи и конкатенируем значения
+    # 2. Добавляем Password КАК ОБЫЧНЫЙ ПАРАМЕТР (участвует в сортировке!)
+    data_copy["Password"] = secret_password
+    
+    # 3. Сортируем ключи и конкатенируем значения
     sorted_values = ""
     for key in sorted(data_copy.keys()):
         value = data_copy[key]
-        if value is not None:
-            sorted_values += str(value)
+        # None превращаем в пустую строку (как в generate)
+        sorted_values += str(value) if value is not None else ""
     
-    # Добавляем секретный пароль
-    sorted_values += secret_password
+    # 4. Хешируем SHA256
+    calculated_token = hashlib.sha256(sorted_values.encode('utf-8')).hexdigest()
     
-    # Хешируем SHA256
-    calculated_token = hashlib.sha256(sorted_values.encode('utf-8')).hexdigest().upper()
-    
-    return calculated_token == received_token.upper()
+    # 5. Сравниваем (в нижнем регистре, без upper())
+    return calculated_token.lower() == received_token.lower()

@@ -694,6 +694,30 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         data = await request.json()
         
         logger.info(f"🔔 Webhook от Т-Банка: {json.dumps(data, ensure_ascii=False)}")
+
+        secret = os.getenv("SECRET_PASSWORD")
+        logger.info(f"🔑 SECRET_PASSWORD из .env: '{secret}' (длина: {len(secret) if secret else 0})")
+        
+        # Проверяем токен
+        is_valid = generator.verify_tbank_webhook_token(data, secret)
+        logger.info(f"✅ Токен валиден: {is_valid}")
+        
+        if not is_valid:
+            # 🔥 ПОКАЖЕМ, ЧТО МЫ СЧИТАЕМ
+            data_copy = {k: v for k, v in data.items() if k != "Token"}
+            data_copy["Password"] = secret
+            sorted_values = ""
+            for key in sorted(data_copy.keys()):
+                value = data_copy[key]
+                sorted_values += str(value) if value is not None else ""
+            
+            calculated = hashlib.sha256(sorted_values.encode('utf-8')).hexdigest()
+            logger.info(f" Сортированная строка: '{sorted_values}'")
+            logger.info(f"📊 Мы насчитали: {calculated}")
+            logger.info(f"📊 Т-Банк прислал: {data.get('Token')}")
+            
+            logger.error(f"❌ НЕВЕРНЫЙ ТОКЕН!")
+            return {"Status": "ERROR"}
         
         payment_id = data.get("PaymentId")
         order_id = data.get("OrderId")
