@@ -37,8 +37,13 @@ def verify_tbank_webhook_token(data: dict, secret_password: str) -> bool:
     sorted_values = ""
     for key in sorted(data_copy.keys()):
         value = data_copy[key]
-        # None превращаем в пустую строку (как в generate)
-        sorted_values += str(value) if value is not None else ""
+        
+        if isinstance(value, bool):
+            sorted_values += "true" if value else "false"
+        elif value is None:
+            sorted_values += ""
+        else:
+            sorted_values += str(value)
     
     # 4. Хешируем SHA256
     calculated_token = hashlib.sha256(sorted_values.encode('utf-8')).hexdigest()
