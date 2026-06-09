@@ -703,7 +703,6 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         logger.info(f"✅ Токен валиден: {is_valid}")
         
         if not is_valid:
-            # 🔥 ПОКАЖЕМ, ЧТО МЫ СЧИТАЕМ
             data_copy = {k: v for k, v in data.items() if k != "Token"}
             data_copy["Password"] = secret
             sorted_values = ""
@@ -719,7 +718,7 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
             logger.error(f"❌ НЕВЕРНЫЙ ТОКЕН!")
             return {"Status": "ERROR"}
         
-        payment_id = data.get("PaymentId")
+        payment_id = str(data.get("PaymentId"))
         order_id = data.get("OrderId")
         status = data.get("Status")
         amount = data.get("Amount")
