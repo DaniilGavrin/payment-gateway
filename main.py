@@ -695,7 +695,7 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         
         logger.info(f"🔔 Webhook от Т-Банка: {json.dumps(data, ensure_ascii=False)}")
         
-        payment_id = data.get("PaymentId")
+        payment_id = str(data.get("PaymentId"))
         order_id = data.get("OrderId")
         status = data.get("Status")
         amount = data.get("Amount")
