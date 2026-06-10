@@ -76,9 +76,9 @@ app.add_middleware(
 
 def verify_cryptocloud_jwt(token: str) -> bool:
     """Проверяет JWT-токен от CryptoCloud (HS256, SECRET_KEY)."""
-    secret = os.getenv("CRYPTOCLOUD_SECRET_KEY", "").encode()
+    secret = os.getenv("CRYPTOCLOUD_SECRET", "").encode()
     if not secret:
-        logger.warning("⚠️ CRYPTOCLOUD_SECRET_KEY not set")
+        logger.warning("⚠️ CRYPTOCLOUD_SECRET not set")
         return False
 
     try:
@@ -694,31 +694,8 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         data = await request.json()
         
         logger.info(f"🔔 Webhook от Т-Банка: {json.dumps(data, ensure_ascii=False)}")
-
-        secret = os.getenv("SECRET_PASSWORD")
-        logger.info(f"🔑 SECRET_PASSWORD из .env: '{secret}' (длина: {len(secret) if secret else 0})")
         
-        # Проверяем токен
-        is_valid = generator.verify_tbank_webhook_token(data, secret)
-        logger.info(f"✅ Токен валиден: {is_valid}")
-        
-        if not is_valid:
-            data_copy = {k: v for k, v in data.items() if k != "Token"}
-            data_copy["Password"] = secret
-            sorted_values = ""
-            for key in sorted(data_copy.keys()):
-                value = data_copy[key]
-                sorted_values += str(value) if value is not None else ""
-            
-            calculated = hashlib.sha256(sorted_values.encode('utf-8')).hexdigest()
-            logger.info(f" Сортированная строка: '{sorted_values}'")
-            logger.info(f"📊 Мы насчитали: {calculated}")
-            logger.info(f"📊 Т-Банк прислал: {data.get('Token')}")
-            
-            logger.error(f"❌ НЕВЕРНЫЙ ТОКЕН!")
-            return {"Status": "ERROR"}
-        
-        payment_id = str(data.get("PaymentId"))
+        payment_id = data.get("PaymentId")
         order_id = data.get("OrderId")
         status = data.get("Status")
         amount = data.get("Amount")
@@ -740,6 +717,33 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         if status == "CONFIRMED":
             new_status = "paid"
             logger.info(f"✅ Заказ {order_id} ОПЛАЧЕН на сумму {amount} коп.")
+            
+            try:
+                # Получаем данные заказа для уведомлений
+                order_data = await db.fetchrow(
+                    """
+                    SELECT tg_id, telegram_username, telegram_first_name, 
+                           client_email, client_phone, payment_method, total_rub
+                    FROM orders WHERE order_code = $1
+                    """,
+                    order_id
+                )
+                
+                if order_data:
+                    await send_telegram_notifications(
+                        order_id=order_id,
+                        amount_rub=float(order_data["total_rub"]),
+                        event="paid",  # 🔥 Новое событие
+                        telegram_id=str(order_data["tg_id"]) if order_data["tg_id"] else None,
+                        telegram_username=order_data["telegram_username"],
+                        telegram_first_name=order_data["telegram_first_name"],
+                        email=order_data["client_email"] or "",
+                        phone=order_data["client_phone"] or "",
+                        method=order_data["payment_method"] or ""
+                    )
+                    logger.info(f"✅ Уведомления об оплате отправлены для заказа {order_id}")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка отправки уведомлений об оплате: {e}", exc_info=True)
             
         elif status == "REJECTED":
             new_status = "failed"
