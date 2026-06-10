@@ -752,6 +752,10 @@ async def tbank_notification(request: Request, _: bool = Depends(require_db_conn
         elif status == "REVERSED":
             new_status = "refunded"
             logger.warning(f"↩️ Заказ {order_id} ОТМЕНЁН (возврат)")
+
+        elif status == "REFUNDED":  # 🔥 ДОБАВЛЕНО
+            new_status = "refunded"
+            logger.warning(f"↩️ Заказ {order_id} ВОЗВРАТ СРЕДСТВ")
             
         elif status == "3DS_CHECKED":
             logger.info(f"⏳ Заказ {order_id}: 3D-Secure проверен, ждём CONFIRMED")
