@@ -112,7 +112,6 @@ async def create_nowpayments_payment(
     order_id: str,
     price_amount: float,
     price_currency: str = "rub",  # 🔥 По умолчанию RUB
-    pay_currency: str = "trc20usdt",
     description: str = ""
 ) -> dict:
     """
@@ -129,7 +128,6 @@ async def create_nowpayments_payment(
     payload = {
         "price_amount": price_amount,
         "price_currency": price_currency,  # 🔥 rub, usd, eur и т.д.
-        "pay_currency": pay_currency,  # trc20usdt, ton, btc и т.д.
         "order_id": order_id,
         "order_description": description or f"Заказ #{order_id} в ByteWizard",
         "ipn_callback_url": ipn_url,  # куда слать вебхуки
@@ -629,7 +627,6 @@ async def _create_nowpayments_payment(order: OrderCreateIn) -> str:
             order_id=order.order_id,
             price_amount=order.total_rub,  # Сумма в рублях
             price_currency="rub",  # 🔥 Валюта цены - RUB
-            pay_currency="trc20usdt",  # Чем платит клиент (USDT TRC20)
             description=f"Заказ #{order.order_id} в ByteWizard"
         )
         
