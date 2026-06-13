@@ -142,7 +142,7 @@ async def create_nowpayments_payment(
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
-            f"{NOWPAYMENTS_API_URL}/payment",
+            f"{NOWPAYMENTS_API_URL}/invoice",
             json=payload,
             headers=headers
         )
@@ -623,7 +623,7 @@ async def _create_nowpayments_payment(order: OrderCreateIn) -> str:
     try:
         # 🔥 ПРАВИЛЬНО: Передаём сумму в RUB напрямую!
         # NOWPayments сам сконвертирует в крипту по актуальному курсу
-        payment_data = await create_nowpayments_payment(
+        invoice_data = await create_nowpayments_payment(
             order_id=order.order_id,
             price_amount=order.total_rub,  # Сумма в рублях
             price_currency="rub",  # 🔥 Валюта цены - RUB
@@ -631,13 +631,13 @@ async def _create_nowpayments_payment(order: OrderCreateIn) -> str:
         )
         
         # NOWPayments возвращает pay_url — это страница, где клиент видит адрес и QR
-        pay_url = payment_data.get("pay_url") or payment_data.get("pay_address_url")
+        invoice_url = invoice_data.get("invoice_url")
         
         if not pay_url:
             # Если pay_url нет, формируем сами (для старых версий API)
-            pay_address = payment_data.get("pay_address")
+            pay_address = invoice_data.get("pay_address")
             if pay_address:
-                pay_url = f"https://nowpayments.io/payment/?iid={payment_data.get('payment_id')}"
+                pay_url = f"https://nowpayments.io/payment/?iid={invoice_data.get('payment_id')}"
             else:
                 raise Exception("NOWPayments не вернул pay_url или pay_address")
         
@@ -648,7 +648,7 @@ async def _create_nowpayments_payment(order: OrderCreateIn) -> str:
             SET payment_id = $1, updated_at = NOW()
             WHERE order_code = $2
             """,
-            str(payment_data.get("payment_id")),
+            str(invoice_data.get("payment_id")),
             order.order_id
         )
         
