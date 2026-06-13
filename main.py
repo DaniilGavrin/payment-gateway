@@ -530,7 +530,7 @@ async def nowpayments_webhook(request: Request, _: bool = Depends(require_db_con
             return JSONResponse(status_code=401, content={"error": "Invalid signature"})
         
         # 2. Извлекаем данные
-        payment_id = str(data.get("payment_id"))
+        payment_id = str(data.get("invoice_id") or data.get("payment_id"))
         payment_status = data.get("payment_status")
         order_id = data.get("order_id")
         actually_paid = data.get("actually_paid", 0)
