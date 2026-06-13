@@ -472,7 +472,7 @@ async def nowpayments_webhook(request: Request, _: bool = Depends(require_db_con
         ipn_secret = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
         if ipn_secret and not verify_nowpayments_signature(data, ipn_secret):
             logger.error("❌ Неверная подпись NOWPayments webhook")
-            return {"error": "Invalid signature"}, 401
+            return JSONResponse(status_code=401, content={"error": "Invalid signature"})
         
         # 2. Извлекаем данные
         payment_id = str(data.get("payment_id"))
