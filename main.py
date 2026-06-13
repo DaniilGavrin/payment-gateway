@@ -21,7 +21,7 @@ from database.db import db
 from dotenv import load_dotenv
 from dependencies import require_db_connection
 
-from models import PaymentRequest, PaymentCancel, PaymentList, CryptoCloudWebhook, OrderCreateIn, OrderCreateOut, OrderItemConfig, OrderItemIn
+from models import PaymentRequest, PaymentCancel, PaymentList, OrderCreateIn, OrderCreateOut, OrderItemConfig, OrderItemIn
 from services.webhook_service import is_webhook_processed, process_payment_webhook, mark_webhook_processed
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header, status
@@ -40,6 +40,38 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET")
+NOWPAYMENTS_API_URL = "https://api.nowpayments.io/v1"
+
+
+def verify_nowpayments_signature(payload: dict, ipn_secret: str) -> bool:
+    """
+    Проверяет HMAC SHA512 подпись от NOWPayments IPN.
+    Документация: https://docs.nowpayments.io/ipn-notifications/
+    """
+    received_signature = payload.get("signature")
+    if not received_signature:
+        logger.warning("⚠️ Нет signature в webhook от NOWPayments")
+        return False
+    
+    # Убираем signature из payload для проверки
+    data_to_sign = {k: v for k, v in payload.items() if k != "signature"}
+    
+    # Сортируем ключи и конкатенируем значения
+    sorted_json = json.dumps(data_to_sign, sort_keys=True, separators=(",", ":"))
+    
+    # HMAC SHA512
+    calculated_signature = hmac.new(
+        ipn_secret.encode("utf-8"),
+        sorted_json.encode("utf-8"),
+        hashlib.sha512
+    ).hexdigest()
+    
+    is_valid = hmac.compare_digest(calculated_signature, received_signature)
+    
+    if not is_valid:
+        logger.error(f"❌ НЕВЕРНАЯ ПОДПИСЬ NOWPayments! Получено: {received_signature[:20]}...")
+    
+    return is_valid
 
 COMPANY_REQUISITES = {
     "name": os.getenv("COMPANY_NAME", "ИП Гаврин Даниил Никитич"),
@@ -74,31 +106,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def verify_cryptocloud_jwt(token: str) -> bool:
-    """Проверяет JWT-токен от CryptoCloud (HS256, SECRET_KEY)."""
-    secret = os.getenv("CRYPTOCLOUD_SECRET", "").encode()
-    if not secret:
-        logger.warning("⚠️ CRYPTOCLOUD_SECRET not set")
-        return False
-
-    try:
-        jwt.decode(token, secret, algorithms=["HS256"], options={"require": ["exp"]})
-        return True
-    except jwt.ExpiredSignatureError:
-        logger.warning(f"⚠️ JWT expired: {token[:20]}...")
-        return False
-    except jwt.InvalidSignatureError:
-        logger.error(f"❌ JWT signature mismatch: {token[:20]}...")
-        return False
-    except jwt.DecodeError as e:
-        logger.error(f"❌ JWT decode error: {e}")
-        return False
-
-def verify_admin_token(token: str = Header(..., alias="X-Admin-Token")):
-    expected = os.getenv("CRYPTOCLOUD_SECRET")
-    if not expected or token != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing admin token")
-    return token
+async def create_nowpayments_payment(
+    order_id: str,
+    price_amount: float,
+    price_currency: str = "rub",  # 🔥 По умолчанию RUB
+    pay_currency: str = "trc20usdt",
+    description: str = ""
+) -> dict:
+    """
+    Создаёт платёж в NOWPayments и возвращает данные для редиректа.
+    Документация: https://docs.nowpayments.io/payment-api/
+    """
+    api_key = os.getenv("NOWPAYMENTS_API_KEY")
+    ipn_secret = os.getenv("NOWPAYMENTS_IPN_SECRET")
+    ipn_url = os.getenv("NOWPAYMENTS_IPN_URL")  # https://pay.bytewizard.ru/api/nowpayments/webhook
+    
+    if not api_key:
+        raise Exception("NOWPAYMENTS_API_KEY не задан в .env")
+    
+    payload = {
+        "price_amount": price_amount,
+        "price_currency": price_currency,  # 🔥 rub, usd, eur и т.д.
+        "pay_currency": pay_currency,  # trc20usdt, ton, btc и т.д.
+        "order_id": order_id,
+        "order_description": description or f"Заказ #{order_id} в ByteWizard",
+        "ipn_callback_url": ipn_url,  # куда слать вебхуки
+        "is_fixed_rate": True,  # фиксируем курс на 20 минут
+        "is_fee_paid_by_user": False  # комиссию платим мы
+    }
+    
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{NOWPAYMENTS_API_URL}/payment",
+            json=payload,
+            headers=headers
+        )
+        
+        result = response.json()
+        
+        if response.status_code != 200:
+            logger.error(f"❌ NOWPayments error: {result}")
+            raise Exception(f"NOWPayments API error: {result.get('message', 'Unknown error')}")
+        
+        logger.info(f"✅ NOWPayments платёж создан: payment_id={result.get('payment_id')}")
+        return result
 
 def calculate_server_price(
     base_price: float,
@@ -349,7 +405,7 @@ async def create_order(
             payment_url = await _create_tbank_payment(payload)
             
         elif payload.payment_method == 'crypto':
-            payment_url = await _create_cryptocloud_payment(payload)
+            payment_url = await _create_nowpayments_payment(payload)
 
         elif payload.payment_method == 'stars':
             payment_url = await _create_telegram_stars_payment(payload)
@@ -401,6 +457,161 @@ async def create_order(
     except Exception as e:
         logger.error(f"❌ Ошибка создания заказа {payload.order_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error while creating order")
+    
+@app.post("/api/nowpayments/webhook")
+async def nowpayments_webhook(request: Request, _: bool = Depends(require_db_connection)):
+    """
+    Обработчик IPN-уведомлений от NOWPayments.
+    Документация: https://docs.nowpayments.io/ipn-notifications/
+    """
+    try:
+        data = await request.json()
+        logger.info(f"🔔 Webhook от NOWPayments: {json.dumps(data, ensure_ascii=False)[:500]}")
+        
+        # 1. Проверяем подпись
+        ipn_secret = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
+        if ipn_secret and not verify_nowpayments_signature(data, ipn_secret):
+            logger.error("❌ Неверная подпись NOWPayments webhook")
+            return {"error": "Invalid signature"}, 401
+        
+        # 2. Извлекаем данные
+        payment_id = str(data.get("payment_id"))
+        payment_status = data.get("payment_status")
+        order_id = data.get("order_id")
+        actually_paid = data.get("actually_paid", 0)
+        pay_amount = data.get("pay_amount", 0)
+        pay_currency = data.get("pay_currency")
+        
+        if not order_id:
+            logger.warning("⚠️ Нет order_id в webhook NOWPayments")
+            return {"ok": True}
+        
+        # 3. Проверка идемпотентности (не обрабатывали ли уже)
+        if await is_webhook_processed(payment_id):
+            logger.info(f"⏭️ Webhook уже обработан: payment_id={payment_id}")
+            return {"ok": True}
+        
+        # 4. Маппинг статусов NOWPayments → наши
+        status_map = {
+            "waiting": "pending",
+            "confirming": "pending",
+            "confirmed": "pending",
+            "sending": "pending",
+            "partially_paid": "pending",
+            "finished": "paid",         # ✅ УСПЕХ
+            "failed": "failed",
+            "refunded": "refunded",
+            "expired": "failed",
+        }
+        
+        new_status = status_map.get(payment_status)
+        
+        if not new_status:
+            logger.warning(f"⚠️ Неизвестный статус NOWPayments: {payment_status}")
+            return {"ok": True}
+        
+        logger.info(f"📊 NOWPayments: payment_id={payment_id}, status={payment_status} → {new_status}")
+        
+        # 5. Обновляем заказ в БД
+        await db.execute(
+            """
+            UPDATE orders 
+            SET status = $1, 
+                payment_id = $2,
+                crypto_paid_amount = $3,
+                crypto_currency = $4,
+                updated_at = NOW()
+            WHERE order_code = $5
+            """,
+            new_status,
+            payment_id,
+            float(actually_paid),
+            pay_currency,
+            order_id
+        )
+        
+        # 6. Помечаем webhook как обработанный
+        await mark_webhook_processed(payment_id)
+        
+        # 7. Если оплата прошла — шлём уведомления
+        if new_status == "paid":
+            try:
+                order_data = await db.fetchrow(
+                    """
+                    SELECT tg_id, telegram_username, telegram_first_name, 
+                           client_email, client_phone, payment_method, total_rub
+                    FROM orders WHERE order_code = $1
+                    """,
+                    order_id
+                )
+                
+                if order_data:
+                    await send_telegram_notifications(
+                        order_id=order_id,
+                        amount_rub=float(order_data["total_rub"]),
+                        event="paid",
+                        telegram_id=str(order_data["tg_id"]) if order_data["tg_id"] else None,
+                        telegram_username=order_data["telegram_username"],
+                        telegram_first_name=order_data["telegram_first_name"],
+                        email=order_data["client_email"] or "",
+                        phone=order_data["client_phone"] or "",
+                        method=f"crypto ({pay_currency})"
+                    )
+                    logger.info(f"✅ Уведомления об оплате отправлены для заказа {order_id}")
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка отправки уведомлений: {e}", exc_info=True)
+        
+        return {"ok": True}
+        
+    except Exception as e:
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА в NOWPayments webhook: {e}", exc_info=True)
+        return {"ok": True}
+    
+
+async def _create_nowpayments_payment(order: OrderCreateIn) -> str:
+    """
+    Создаёт платёж в NOWPayments (крипта: USDT TRC20 / TON / BTC).
+    Возвращает URL страницы оплаты для редиректа клиента.
+    """
+    try:
+        # 🔥 ПРАВИЛЬНО: Передаём сумму в RUB напрямую!
+        # NOWPayments сам сконвертирует в крипту по актуальному курсу
+        payment_data = await create_nowpayments_payment(
+            order_id=order.order_id,
+            price_amount=order.total_rub,  # Сумма в рублях
+            price_currency="rub",  # 🔥 Валюта цены - RUB
+            pay_currency="trc20usdt",  # Чем платит клиент (USDT TRC20)
+            description=f"Заказ #{order.order_id} в ByteWizard"
+        )
+        
+        # NOWPayments возвращает pay_url — это страница, где клиент видит адрес и QR
+        pay_url = payment_data.get("pay_url") or payment_data.get("pay_address_url")
+        
+        if not pay_url:
+            # Если pay_url нет, формируем сами (для старых версий API)
+            pay_address = payment_data.get("pay_address")
+            if pay_address:
+                pay_url = f"https://nowpayments.io/payment/?iid={payment_data.get('payment_id')}"
+            else:
+                raise Exception("NOWPayments не вернул pay_url или pay_address")
+        
+        # Сохраняем payment_id в БД для связки с вебхуком
+        await db.execute(
+            """
+            UPDATE orders 
+            SET payment_id = $1, updated_at = NOW()
+            WHERE order_code = $2
+            """,
+            str(payment_data.get("payment_id")),
+            order.order_id
+        )
+        
+        logger.info(f"✅ NOWPayments ссылка: {pay_url}")
+        return pay_url
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания NOWPayments платежа: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Не удалось создать крипто-платёж: {str(e)}")
 
 async def _create_tbank_payment(order: OrderCreateIn) -> str:
     """Создает платеж в T-Bank и возвращает ссылку на оплату"""
@@ -461,32 +672,6 @@ async def _create_tbank_payment(order: OrderCreateIn) -> str:
 
     finally:
         conn.close()
-
-async def _create_cryptocloud_payment(order: OrderCreateIn) -> str:
-    """Создает инвойс в CryptoCloud и возвращает ссылку"""
-    url = f"{os.getenv('CRYPTOCLOUD_API_URL')}invoice/create"
-    headers = {
-        "Authorization": f"Token {os.getenv('CRYPTOCLOUD_API_KEY')}",
-        "Content-Type": "application/json"
-    }
-    
-    data = {
-        "amount": order.total_rub,
-        "shop_id": os.getenv("CRYPTOCLOUD_SHOP_ID"),
-        "currency": "RUB",
-        "order_id": order.order_id,
-        "success_url": f"https://shop.bytewizard.ru/{order.locale}/profile?order={order.order_id}&status=success",
-        "fail_url": f"https://shop.bytewizard.ru/{order.locale}/profile?order={order.order_id}&status=failed",
-    }
-    
-    response = requests.post(url, headers=headers, json=data)
-    
-    if response.status_code == 200:
-        result = response.json()["result"]
-        return result["link"]
-    else:
-        logger.error(f"CryptoCloud error: {response.text}")
-        raise Exception(f"CryptoCloud API error: {response.text[:200]}")
 
 async def _create_telegram_stars_payment(order: OrderCreateIn) -> str:
     """Создает инвойс в Telegram Stars и возвращает прямую ссылку на оплату"""
@@ -593,97 +778,6 @@ async def _generate_and_send_invoice(order: OrderCreateIn) -> str:
     except Exception as e:
         logger.error(f"❌ Ошибка создания счёта: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Не удалось создать счёт")
-
-@app.get("/orders/check")
-async def check_orders():
-    pass
-
-@app.post("/api/crypto-cloud/list-payments")
-async def cryptocloud_list_payments(req: PaymentList, _: str = Depends(verify_admin_token), _db: bool = Depends(require_db_connection)):
-    url = f"{os.getenv('CRYPTOCLOUD_API_URL')}invoice/merchant/list"
-
-    headers = {
-        "Authorization": f"Token {os.getenv('CRYPTOCLOUD_API_KEY')}",
-        "Content-Type": "application/json"
-    }
-
-    data = {
-        "start": req.start,
-        "end": req.end,
-        "offset": req.offset,
-        "limit": req.limit
-    }
-
-    print(f"🔍 URL: {url}")
-    print(f"🔍 Data: {data}")
-
-    response = requests.post(url, headers=headers, json=data)
-
-    if response.status_code == 200:
-        print("Success:", response.json())
-        result = response.json()
-        return {
-            "success": True,
-            "data": result.get("result", []),
-            "pagination": {
-                "offset": req.offset,
-                "limit": req.limit,
-                "total": len(result.get("result", []))
-            }
-        }
-    else:
-        print(f"❌ Fail {response.status_code}: {response.text[:300]}")
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"CryptoCloud error: {response.text[:200]}"
-        )
-
-@app.post("/api/crypto-cloud/callback")
-async def cryptocloud_webhook(request: Request, _db: bool = Depends(require_db_connection)):
-    """
-    Обработчик POSTBACK от CryptoCloud (только JSON).
-    """
-
-    if not request.headers.get("Content-Type", "").startswith("application/json"):
-        logger.warning(f"❌ Wrong Content-Type: {request.headers.get('Content-Type')}")
-        raise HTTPException(status_code=415, detail="Only application/json accepted")
-
-    try:
-        body = await request.json()
-    except Exception as e:
-        logger.error(f"❌ JSON parse error: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    try:
-        webhook = CryptoCloudWebhook(**body)
-    except Exception as e:
-        logger.warning(f"⚠️ Validation error: {e}")
-        raise HTTPException(status_code=422, detail=f"Invalid payload: {str(e)}")
-
-    if not verify_cryptocloud_jwt(webhook.token):
-        raise HTTPException(status_code=401, detail="Invalid token signature")
-
-    if await is_webhook_processed(webhook.invoice_id):
-        logger.info(f"⏭️ Duplicate webhook, skipping: {webhook.invoice_id}")
-        return JSONResponse(status_code=200, content={"status": "ok", "skipped": True})
-
-    await process_payment_webhook(
-        invoice_id=webhook.invoice_id,
-        order_id=webhook.order_id,
-        status=webhook.status,
-        invoice_info=webhook.invoice_info
-    )
-
-    await mark_webhook_processed(webhook.invoice_id)
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "ok",
-            "invoice_id": webhook.invoice_id,
-            "processed_at": datetime.utcnow().isoformat()
-        }
-    )
 
 @app.post("/api/t-bank/notification")
 async def tbank_notification(request: Request, _: bool = Depends(require_db_connection)):

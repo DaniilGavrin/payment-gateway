@@ -46,14 +46,31 @@ class PaymentList(BaseModel):
         }
     }
 
-class CryptoCloudWebhook(BaseModel):
-    status: str = Field(..., pattern="^(success|failed|expired|canceled)$")
-    invoice_id: str = Field(..., min_length=1)  # без префикса INV
-    order_id: str | None = None
-    amount_crypto: float = Field(..., gt=0)
-    currency: str = Field(..., min_length=3)
-    token: str = Field(..., min_length=20)
-    invoice_info: dict | None = None  # подробная инфа, если пришла
+class NOWPaymentsWebhook(BaseModel):
+    """
+    Модель IPN-уведомления от NOWPayments.
+    Документация: https://docs.nowpayments.io/ipn-notifications/
+    """
+    payment_id: int = Field(..., description="ID платежа в NOWPayments")
+    payment_status: str = Field(..., description="Статус: waiting/confirming/confirmed/sending/finished/failed/refunded/expired")
+    pay_address: str = Field(..., description="Адрес кошелька для оплаты")
+    price_amount: float = Field(..., gt=0, description="Цена в price_currency")
+    price_currency: str = Field(..., description="Валюта цены (usd/rub)")
+    pay_amount: float = Field(..., description="Сумма к оплате в pay_currency")
+    actually_paid: float = Field(default=0, description="Фактически оплачено")
+    pay_currency: str = Field(..., description="Валюта оплаты (trc20usdt/ton/btc)")
+    order_id: str = Field(..., min_length=1, description="Наш order_code")
+    order_description: Optional[str] = Field(None, max_length=500)
+    purchase_id: Optional[str] = None
+    outcome_amount: Optional[float] = None
+    outcome_currency: Optional[str] = None
+    created_at: str = Field(..., description="ISO datetime")
+    updated_at: Optional[str] = None
+    outcome_wallet_address: Optional[str] = None
+    network: Optional[str] = None
+    pay_extra: Optional[Any] = None
+    status: Optional[str] = None  # дублирует payment_status в некоторых версиях API
+    signature: Optional[str] = Field(None, description="HMAC SHA512 подпись от NOWPayments")
 
 
 # --- Вспомогательные модели для конфигурации товара ---
