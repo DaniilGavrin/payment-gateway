@@ -1,6 +1,7 @@
 import asyncio
 from io import BytesIO
 import os
+from fastapi.exceptions import RequestValidationError
 from fastapi.params import Path, Query
 import requests
 import jwt
@@ -42,37 +43,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET")
 NOWPAYMENTS_API_URL = "https://api.nowpayments.io/v1"
 
-
-def verify_nowpayments_signature(payload: dict, ipn_secret: str) -> bool:
-    """
-    Проверяет HMAC SHA512 подпись от NOWPayments IPN.
-    Документация: https://docs.nowpayments.io/ipn-notifications/
-    """
-    received_signature = payload.get("signature")
-    if not received_signature:
-        logger.warning("⚠️ Нет signature в webhook от NOWPayments")
-        return False
-    
-    # Убираем signature из payload для проверки
-    data_to_sign = {k: v for k, v in payload.items() if k != "signature"}
-    
-    # Сортируем ключи и конкатенируем значения
-    sorted_json = json.dumps(data_to_sign, sort_keys=True, separators=(",", ":"))
-    
-    # HMAC SHA512
-    calculated_signature = hmac.new(
-        ipn_secret.encode("utf-8"),
-        sorted_json.encode("utf-8"),
-        hashlib.sha512
-    ).hexdigest()
-    
-    is_valid = hmac.compare_digest(calculated_signature, received_signature)
-    
-    if not is_valid:
-        logger.error(f"❌ НЕВЕРНАЯ ПОДПИСЬ NOWPayments! Получено: {received_signature[:20]}...")
-    
-    return is_valid
-
 COMPANY_REQUISITES = {
     "name": os.getenv("COMPANY_NAME", "ИП Гаврин Даниил Никитич"),
     "inn": os.getenv("COMPANY_INN", "434584462396"),
@@ -105,6 +75,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Перехватывает ВСЕ ошибки валидации Pydantic и логирует их подробно.
+    Теперь ты точно увидишь, какое поле не прошло проверку.
+    """
+    body_bytes = await request.body()
+    body_str = body_bytes.decode('utf-8', errors='ignore')
+    
+    logger.error("=" * 60)
+    logger.error(f"❌ ОШИБКА ВАЛИДАЦИИ PAYLOAD!")
+    logger.error(f"   URL: {request.method} {request.url}")
+    logger.error(f"   Content-Type: {request.headers.get('content-type', 'N/A')}")
+    logger.error(f"   Body (первые 2000 символов): {body_str[:2000]}")
+    logger.error(f"   Ошибки Pydantic:")
+    for err in exc.errors():
+        field_path = " → ".join(str(loc) for loc in err["loc"])
+        logger.error(f"      📍 Поле: {field_path}")
+        logger.error(f"         Тип ошибки: {err['type']}")
+        logger.error(f"         Сообщение: {err['msg']}")
+        logger.error(f"         Полученное значение: {err.get('input', 'N/A')}")
+    logger.error("=" * 60)
+    
+    return JSONResponse(
+        status_code=400,
+        content={
+            "success": False,
+            "error": "Validation error",
+            "details": exc.errors()
+        },
+    )
 
 async def create_nowpayments_payment(
     order_id: str,
@@ -155,6 +157,36 @@ async def create_nowpayments_payment(
         
         logger.info(f"✅ NOWPayments платёж создан: payment_id={result.get('payment_id')}")
         return result
+    
+def verify_nowpayments_signature(payload: dict, ipn_secret: str) -> bool:
+    """
+    Проверяет HMAC SHA512 подпись от NOWPayments IPN.
+    Документация: https://docs.nowpayments.io/ipn-notifications/
+    """
+    received_signature = payload.get("signature")
+    if not received_signature:
+        logger.warning("⚠️ Нет signature в webhook от NOWPayments")
+        return False
+    
+    # Убираем signature из payload для проверки
+    data_to_sign = {k: v for k, v in payload.items() if k != "signature"}
+    
+    # Сортируем ключи и конкатенируем значения
+    sorted_json = json.dumps(data_to_sign, sort_keys=True, separators=(",", ":"))
+    
+    # HMAC SHA512
+    calculated_signature = hmac.new(
+        ipn_secret.encode("utf-8"),
+        sorted_json.encode("utf-8"),
+        hashlib.sha512
+    ).hexdigest()
+    
+    is_valid = hmac.compare_digest(calculated_signature, received_signature)
+    
+    if not is_valid:
+        logger.error(f"❌ НЕВЕРНАЯ ПОДПИСЬ NOWPayments! Получено: {received_signature[:20]}...")
+    
+    return is_valid
 
 def calculate_server_price(
     base_price: float,
@@ -278,6 +310,15 @@ async def create_order(
     _db: bool = Depends(require_db_connection)
 ):
     logger.info(f"📦 Новый заказ: {payload.order_id} | User: {current_user['tg_id']}")
+
+    try:
+        logger.info(f"📥 PAYLOAD: {payload.model_dump_json() if hasattr(payload, 'model_dump_json') else payload.dict()}")
+        logger.info(f"   📦 Товаров в заказе: {len(payload.items)}")
+        for i, item in enumerate(payload.items):
+            logger.info(f"   📦 Товар #{i+1}: id={item.product_id}, name='{item.product_name}', price={item.price_rub}₽, days={item.delivery_days}")
+            logger.info(f"      Config keys: {list(item.config.__dict__.keys()) if hasattr(item.config, '__dict__') else 'N/A'}")
+    except Exception as log_err:
+        logger.warning(f"⚠️ Не удалось залогировать payload: {log_err}")
     
     try:
         # 🔥 ШАГ 0: ВАЛИДАЦИЯ ЦЕНЫ И СРОКОВ НА СЕРВЕРЕ
@@ -399,22 +440,30 @@ async def create_order(
             )
         
         # 🔹 3. Маршрутизация на платежный шлюз
-        payment_url = None
+        logger.info(f"💳 Метод оплаты: {payload.payment_method}")
         
         if payload.payment_method in ['card', 'sbp']:
+            logger.info(f"🏦 Создаём платёж в Т-Банк...")
             payment_url = await _create_tbank_payment(payload)
+            logger.info(f"✅ Т-Банк URL: {payment_url[:50]}...")
             
         elif payload.payment_method == 'crypto':
+            logger.info(f"₿ Создаём платёж в NOWPayments...")
             payment_url = await _create_nowpayments_payment(payload)
+            logger.info(f"✅ NOWPayments URL: {payment_url[:50]}...")
 
         elif payload.payment_method == 'stars':
+            logger.info(f"⭐ Создаём платёж в Telegram Stars...")
             payment_url = await _create_telegram_stars_payment(payload)
+            logger.info(f"✅ Stars URL: {payment_url[:50]}...")
             
         elif payload.payment_method == 'invoice':
-            # 📄 Генерация PDF и отправка в TG + email
+            logger.info(f"📄 Генерируем счёт для юр. лица...")
             payment_url = await _generate_and_send_invoice(payload)
+            logger.info(f"✅ Счёт создан: {payment_url[:50]}...")
         
         if not payment_url:
+            logger.error(f"❌ payment_url пустой после обработки метода {payload.payment_method}")
             raise HTTPException(status_code=502, detail="Не удалось создать ссылку на оплату")
         
         logger.info(f"✅ Заказ {payload.order_id} создан. Оплата: {payment_url}")
