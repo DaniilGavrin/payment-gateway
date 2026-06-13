@@ -108,37 +108,41 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         },
     )
 
-async def create_nowpayments_payment(
+async def create_nowpayments_invoice(
     order_id: str,
     price_amount: float,
-    price_currency: str = "rub",  # 🔥 По умолчанию RUB
+    price_currency: str = "rub",
     description: str = ""
 ) -> dict:
     """
-    Создаёт платёж в NOWPayments и возвращает данные для редиректа.
-    Документация: https://docs.nowpayments.io/payment-api/
+    Создаёт ИНВОЙС в NOWPayments.
+    Документация: https://docs.nowpayments.io/invoice-api/
     """
     api_key = os.getenv("NOWPAYMENTS_API_KEY")
-    ipn_secret = os.getenv("NOWPAYMENTS_IPN_SECRET")
-    ipn_url = os.getenv("NOWPAYMENTS_IPN_URL")  # https://pay.bytewizard.ru/api/nowpayments/webhook
+    ipn_url = os.getenv("NOWPAYMENTS_IPN_URL")
     
     if not api_key:
         raise Exception("NOWPAYMENTS_API_KEY не задан в .env")
     
     payload = {
         "price_amount": price_amount,
-        "price_currency": price_currency,  # 🔥 rub, usd, eur и т.д.
+        "price_currency": price_currency,
         "order_id": order_id,
         "order_description": description or f"Заказ #{order_id} в ByteWizard",
-        "ipn_callback_url": ipn_url,  # куда слать вебхуки
-        "is_fixed_rate": True,  # фиксируем курс на 20 минут
-        "is_fee_paid_by_user": False  # комиссию платим мы
+        "is_fixed_rate": True,
+        "is_fee_paid_by_user": False,
     }
+    
+    # IPN URL указываем только если задан
+    if ipn_url:
+        payload["ipn_callback_url"] = ipn_url
     
     headers = {
         "x-api-key": api_key,
         "Content-Type": "application/json"
     }
+    
+    logger.info(f"📤 NOWPayments INVOICE запрос: {json.dumps(payload, ensure_ascii=False)}")
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
@@ -149,11 +153,15 @@ async def create_nowpayments_payment(
         
         result = response.json()
         
-        if response.status_code != 200:
-            logger.error(f"❌ NOWPayments error: {result}")
+        # 🔥 Логируем ВЕСЬ ответ, чтобы видеть реальную структуру
+        logger.info(f"📥 NOWPayments INVOICE ответ (status={response.status_code}): {json.dumps(result, ensure_ascii=False)[:1000]}")
+        
+        if response.status_code not in (200, 201):
+            logger.error(f"❌ NOWPayments INVOICE error: {result}")
             raise Exception(f"NOWPayments API error: {result.get('message', 'Unknown error')}")
         
-        logger.info(f"✅ NOWPayments платёж создан: payment_id={result.get('payment_id')}")
+        # 🔥 Invoice API возвращает invoice_id, а не payment_id
+        logger.info(f"✅ NOWPayments инвойс создан: invoice_id={result.get('invoice_id')}")
         return result
     
 def verify_nowpayments_signature(payload: dict, ipn_secret: str) -> bool:
@@ -617,46 +625,40 @@ async def nowpayments_webhook(request: Request, _: bool = Depends(require_db_con
 
 async def _create_nowpayments_payment(order: OrderCreateIn) -> str:
     """
-    Создаёт платёж в NOWPayments (крипта: USDT TRC20 / TON / BTC).
-    Возвращает URL страницы оплаты для редиректа клиента.
+    Создаёт инвойс в NOWPayments.
+    Клиент сам выберет криптовалюту на странице оплаты.
     """
     try:
-        # 🔥 ПРАВИЛЬНО: Передаём сумму в RUB напрямую!
-        # NOWPayments сам сконвертирует в крипту по актуальному курсу
-        invoice_data = await create_nowpayments_payment(
+        invoice_data = await create_nowpayments_invoice(
             order_id=order.order_id,
-            price_amount=order.total_rub,  # Сумма в рублях
-            price_currency="rub",  # 🔥 Валюта цены - RUB
+            price_amount=order.total_rub,
+            price_currency="rub",
             description=f"Заказ #{order.order_id} в ByteWizard"
         )
         
-        # NOWPayments возвращает pay_url — это страница, где клиент видит адрес и QR
         invoice_url = invoice_data.get("invoice_url")
         
-        if not pay_url:
-            # Если pay_url нет, формируем сами (для старых версий API)
-            pay_address = invoice_data.get("pay_address")
-            if pay_address:
-                pay_url = f"https://nowpayments.io/payment/?iid={invoice_data.get('payment_id')}"
-            else:
-                raise Exception("NOWPayments не вернул pay_url или pay_address")
+        if not invoice_url:
+            logger.error(f"❌ NOWPayments не вернул invoice_url! Полный ответ: {invoice_data}")
+            raise Exception("NOWPayments не вернул invoice_url")
         
-        # Сохраняем payment_id в БД для связки с вебхуком
-        await db.execute(
-            """
-            UPDATE orders 
-            SET payment_id = $1, updated_at = NOW()
-            WHERE order_code = $2
-            """,
-            str(invoice_data.get("payment_id")),
-            order.order_id
-        )
+        invoice_id = str(invoice_data.get("invoice_id", ""))
+        if invoice_id:
+            await db.execute(
+                """
+                UPDATE orders 
+                SET payment_id = $1, updated_at = NOW()
+                WHERE order_code = $2
+                """,
+                invoice_id,
+                order.order_id
+            )
         
-        logger.info(f"✅ NOWPayments ссылка: {pay_url}")
-        return pay_url
+        logger.info(f"✅ NOWPayments ссылка: {invoice_url}")
+        return invoice_url
         
     except Exception as e:
-        logger.error(f"❌ Ошибка создания NOWPayments платежа: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка создания NOWPayments инвойса: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail=f"Не удалось создать крипто-платёж: {str(e)}")
 
 async def _create_tbank_payment(order: OrderCreateIn) -> str:
